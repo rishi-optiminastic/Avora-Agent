@@ -47,11 +47,15 @@ func path() (string, error) {
 	return filepath.Join(dir, "agent.json"), nil
 }
 
-// Load reads the config, applying defaults for a first run and honouring the
-// AVORA_FE_URL / AVORA_API_URL env overrides (handy for pointing at prod or a
-// local stack). A missing file is not an error — it yields a default config.
+// Load reads persisted state (device token + sequence). A missing file is not
+// an error — it yields a fresh config.
+//
+// The FE/API URLs are ALWAYS taken from the build (ldflags defaults) + env
+// override, never from the persisted file — so a binary always talks to the
+// backend it was built for, even if an older config on disk points elsewhere
+// (e.g. a leftover localhost config from dev).
 func Load() (*Config, error) {
-	cfg := &Config{FEBaseURL: defaultFEURL, APIBaseURL: defaultAPIURL}
+	cfg := &Config{}
 	p, err := path()
 	if err != nil {
 		return nil, err
@@ -64,13 +68,16 @@ func Load() (*Config, error) {
 	case !os.IsNotExist(err):
 		return nil, err
 	}
-	if v := os.Getenv("AVORA_FE_URL"); v != "" {
-		cfg.FEBaseURL = v
-	}
-	if v := os.Getenv("AVORA_API_URL"); v != "" {
-		cfg.APIBaseURL = v
-	}
+	cfg.FEBaseURL = envOr("AVORA_FE_URL", defaultFEURL)
+	cfg.APIBaseURL = envOr("AVORA_API_URL", defaultAPIURL)
 	return cfg, nil
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // Save writes the config back with 0600 perms (0700 dir).
