@@ -59,8 +59,14 @@ func cmdInstall(cfg *config.Config) {
 		cfg.Sequence = 0
 		check(cfg.Save())
 	}
-	check(autostart.Enable(target))
-	fmt.Println("Avora is set up — it will run automatically at login. You can close this window.")
+	// Auto-start is best-effort: if registering it fails, the device is still
+	// enrolled — tell the user how to start it rather than aborting the install.
+	if err := autostart.Enable(target); err != nil {
+		fmt.Fprintln(os.Stderr, "warn: could not enable auto-start: "+err.Error())
+		fmt.Printf("Avora is connected. Start it manually with:\n  %q run\n", target)
+		return
+	}
+	fmt.Println("Avora is set up — it's running now and will start automatically at login.")
 }
 
 func cmdUninstall() {

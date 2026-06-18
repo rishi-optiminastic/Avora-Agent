@@ -5,7 +5,9 @@ package autostart
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 )
 
 func desktopPath() (string, error) {
@@ -25,7 +27,13 @@ func Enable(execPath string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(fmt.Sprintf(desktopTemplate, execPath)), 0o644)
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(desktopTemplate, execPath)), 0o644); err != nil {
+		return err
+	}
+	// Start now, in its own session so it survives the launching shell.
+	cmd := exec.Command(execPath, "run")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd.Start()
 }
 
 // Disable removes the autostart entry.

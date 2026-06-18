@@ -26,6 +26,10 @@ import (
 // ErrReplay means the server rejected the sequence as reused/out-of-order (409).
 var ErrReplay = errors.New("sequence rejected as replay")
 
+// ErrUnauthorized means the device token was rejected (revoked or invalid) — a
+// 401 from any endpoint. The agent treats it as a signal to stop and de-enroll.
+var ErrUnauthorized = errors.New("device token rejected (revoked or invalid)")
+
 // payload mirrors the backend ActivityIngest schema, which forbids extra keys.
 type payload struct {
 	Sequence        int     `json:"sequence"`
@@ -80,6 +84,8 @@ func Send(client *http.Client, cfg *config.Config, sequence int, s collect.Sampl
 		return nil
 	case http.StatusConflict:
 		return ErrReplay
+	case http.StatusUnauthorized:
+		return ErrUnauthorized
 	default:
 		return fmt.Errorf("ingest failed (%s): %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
@@ -108,6 +114,9 @@ func FetchPings(client *http.Client, cfg *config.Config) ([]Ping, error) {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("pings fetch failed (%s): %s", resp.Status, strings.TrimSpace(string(msg)))
@@ -145,6 +154,9 @@ func SendScreenshot(client *http.Client, cfg *config.Config, shot capture.Shot) 
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return ErrUnauthorized
+	}
 	msg, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusAccepted {
 		return fmt.Errorf("screenshot upload failed (%s): %s", resp.Status, strings.TrimSpace(string(msg)))

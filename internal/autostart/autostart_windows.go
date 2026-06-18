@@ -2,24 +2,34 @@
 
 package autostart
 
-import "os/exec"
+import (
+	"os/exec"
+	"syscall"
+)
 
-const taskName = "AvoraAgent"
+const (
+	runKey    = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+	valueName = "AvoraAgent"
+	// DETACHED_PROCESS — the started agent has no console and survives the
+	// terminal that launched it closing.
+	detachedProcess = 0x00000008
+)
 
-// Enable registers a logon-triggered Scheduled Task and starts it now.
+// Enable registers the agent to launch at logon via the per-user Run key (no
+// admin required, unlike a Scheduled Task) and starts it now, detached.
 func Enable(execPath string) error {
-	err := exec.Command(
-		"schtasks", "/Create", "/TN", taskName,
-		"/TR", `"`+execPath+`" run`, "/SC", "ONLOGON", "/F",
-	).Run()
-	if err != nil {
+	if err := exec.Command(
+		"reg", "add", runKey, "/v", valueName, "/t", "REG_SZ",
+		"/d", `"`+execPath+`" run`, "/f",
+	).Run(); err != nil {
 		return err
 	}
-	_ = exec.Command("schtasks", "/Run", "/TN", taskName).Run() // start immediately
-	return nil
+	cmd := exec.Command(execPath, "run")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: detachedProcess}
+	return cmd.Start()
 }
 
-// Disable removes the Scheduled Task.
+// Disable removes the Run-key entry.
 func Disable() error {
-	return exec.Command("schtasks", "/Delete", "/TN", taskName, "/F").Run()
+	return exec.Command("reg", "delete", runKey, "/v", valueName, "/f").Run()
 }

@@ -5,10 +5,12 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"avora-agent/internal/autostart"
 	"avora-agent/internal/capture"
 	"avora-agent/internal/collect"
 	"avora-agent/internal/config"
@@ -22,19 +24,26 @@ const (
 	screenshotEverySteps = 20 // ~5min
 )
 
-// Run loops until the process is interrupted.
+// Run loops until interrupted, or until the device token is rejected (revoked),
+// in which case it de-enrolls and exits cleanly.
 func Run(cfg *config.Config) error {
 	client := &http.Client{Timeout: 20 * time.Second}
 	fmt.Println("Avora agent running — Ctrl-C to stop.")
 	for step := 0; ; step++ {
-		handlePings(client, cfg)
+		if err := handlePings(client, cfg); revoked(err) {
+			return deauthorize(cfg)
+		}
 		if step%activityEverySteps == 0 {
-			if err := tick(client, cfg); err != nil {
+			if err := tick(client, cfg); revoked(err) {
+				return deauthorize(cfg)
+			} else if err != nil {
 				fmt.Println("  warn: " + err.Error())
 			}
 		}
 		if step%screenshotEverySteps == 0 {
-			if err := shotTick(client, cfg); err != nil {
+			if err := shotTick(client, cfg); revoked(err) {
+				return deauthorize(cfg)
+			} else if err != nil {
 				fmt.Println("  warn (screenshot): " + err.Error())
 			}
 		}
@@ -42,16 +51,31 @@ func Run(cfg *config.Config) error {
 	}
 }
 
+func revoked(err error) bool { return errors.Is(err, ingest.ErrUnauthorized) }
+
+// deauthorize stops the agent cleanly when the device is revoked: remove
+// auto-start (so it won't relaunch at login), clear the dead token, and exit.
+// Reconnecting is then a single `avora-agent install`.
+func deauthorize(cfg *config.Config) error {
+	fmt.Println("This device was revoked in Avora — stopping. Run `avora-agent install` to reconnect.")
+	_ = autostart.Disable()
+	cfg.DeviceToken = ""
+	cfg.Sequence = 0
+	_ = cfg.Save()
+	return nil
+}
+
 // handlePings delivers any inbound pings — sound + on-screen message.
-func handlePings(client *http.Client, cfg *config.Config) {
+func handlePings(client *http.Client, cfg *config.Config) error {
 	pings, err := ingest.FetchPings(client, cfg)
 	if err != nil {
-		return // transient; try again next tick
+		return err // caller checks for a revoked token; otherwise transient
 	}
 	for _, p := range pings {
 		notify.Ping(p.Message)
 		fmt.Printf("  🔔 ping received: %s\n", p.Message)
 	}
+	return nil
 }
 
 func tick(client *http.Client, cfg *config.Config) error {
