@@ -91,9 +91,11 @@ func Send(client *http.Client, cfg *config.Config, sequence int, s collect.Sampl
 	}
 }
 
-// Ping is a downlink command from a manager/admin.
+// Ping is a downlink command from a manager/admin. Kind is "ping" (sound +
+// message) or "capture" (take a screenshot now).
 type Ping struct {
 	ID        string `json:"id"`
+	Kind      string `json:"kind"`
 	Message   string `json:"message"`
 	CreatedAt string `json:"created_at"`
 }

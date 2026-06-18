@@ -65,13 +65,21 @@ func deauthorize(cfg *config.Config) error {
 	return nil
 }
 
-// handlePings delivers any inbound pings — sound + on-screen message.
+// handlePings delivers inbound commands: a "capture" takes a screenshot now; a
+// "ping" plays a sound + shows the message.
 func handlePings(client *http.Client, cfg *config.Config) error {
 	pings, err := ingest.FetchPings(client, cfg)
 	if err != nil {
 		return err // caller checks for a revoked token; otherwise transient
 	}
 	for _, p := range pings {
+		if p.Kind == "capture" {
+			fmt.Println("  📸 capture requested")
+			if err := shotTick(client, cfg); err != nil {
+				fmt.Println("  warn (capture): " + err.Error())
+			}
+			continue
+		}
 		notify.Ping(p.Message)
 		fmt.Printf("  🔔 ping received: %s\n", p.Message)
 	}
