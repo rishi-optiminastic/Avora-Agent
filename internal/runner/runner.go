@@ -22,6 +22,8 @@ const (
 	baseInterval         = 15 * time.Second
 	activityEverySteps   = 4  // ~60s
 	screenshotEverySteps = 20 // ~5min
+	// Debounce event-triggered screenshots so rapid app-switching can't spam.
+	eventShotMinInterval = 90 * time.Second
 )
 
 // Run loops until interrupted, or until the device token is rejected (revoked),
@@ -29,22 +31,41 @@ const (
 func Run(cfg *config.Config) error {
 	client := &http.Client{Timeout: 20 * time.Second}
 	fmt.Println("Avora agent running — Ctrl-C to stop.")
+	var lastApp string
+	var lastEventShot time.Time
 	for step := 0; ; step++ {
+		// Always poll commands first — even in personal mode, so a "resume"
+		// (mode_work) command can turn capture back on.
 		if err := handlePings(client, cfg); revoked(err) {
 			return deauthorize(cfg)
 		}
-		if step%activityEverySteps == 0 {
-			if err := tick(client, cfg); revoked(err) {
-				return deauthorize(cfg)
-			} else if err != nil {
-				fmt.Println("  warn: " + err.Error())
+		// Personal mode pauses all capture; the server drops it anyway, but we
+		// don't even collect/send it.
+		if !cfg.PersonalMode {
+			if step%activityEverySteps == 0 {
+				app, err := tick(client, cfg)
+				if revoked(err) {
+					return deauthorize(cfg)
+				} else if err != nil {
+					fmt.Println("  warn: " + err.Error())
+				}
+				// Event-triggered screenshot: the foreground app changed.
+				if app != "" && app != lastApp {
+					lastApp = app
+					if time.Since(lastEventShot) > eventShotMinInterval {
+						if err := shotTick(client, cfg); err == nil {
+							lastEventShot = time.Now()
+						}
+					}
+				}
 			}
-		}
-		if step%screenshotEverySteps == 0 {
-			if err := shotTick(client, cfg); revoked(err) {
-				return deauthorize(cfg)
-			} else if err != nil {
-				fmt.Println("  warn (screenshot): " + err.Error())
+			if step%screenshotEverySteps == 0 {
+				if err := shotTick(client, cfg); revoked(err) {
+					return deauthorize(cfg)
+				} else if err != nil {
+					fmt.Println("  warn (screenshot): " + err.Error())
+				}
+				lastEventShot = time.Now()
 			}
 		}
 		time.Sleep(baseInterval)
@@ -73,23 +94,46 @@ func handlePings(client *http.Client, cfg *config.Config) error {
 		return err // caller checks for a revoked token; otherwise transient
 	}
 	for _, p := range pings {
-		if p.Kind == "capture" {
+		switch p.Kind {
+		case "capture":
 			fmt.Println("  📸 capture requested")
 			if err := shotTick(client, cfg); err != nil {
 				fmt.Println("  warn (capture): " + err.Error())
 			}
-			continue
+		case "mode_personal":
+			setMode(cfg, true)
+		case "mode_work":
+			setMode(cfg, false)
+		default:
+			notify.Ping(p.Message)
+			fmt.Printf("  🔔 ping received: %s\n", p.Message)
 		}
-		notify.Ping(p.Message)
-		fmt.Printf("  🔔 ping received: %s\n", p.Message)
 	}
 	return nil
 }
 
-func tick(client *http.Client, cfg *config.Config) error {
+// setMode flips personal/work capture and persists it so it survives a restart.
+func setMode(cfg *config.Config, personal bool) {
+	if cfg.PersonalMode == personal {
+		return
+	}
+	cfg.PersonalMode = personal
+	if personal {
+		fmt.Println("  ⏸️  personal mode — capture paused")
+	} else {
+		fmt.Println("  ▶️  work mode — capture resumed")
+	}
+	if err := cfg.Save(); err != nil {
+		fmt.Println("  warn (mode save): " + err.Error())
+	}
+}
+
+// tick collects + sends one activity sample and returns the foreground app it
+// observed (so the loop can trigger an event screenshot when it changes).
+func tick(client *http.Client, cfg *config.Config) (string, error) {
 	sample, err := collect.Collect()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	cfg.Sequence++
@@ -101,15 +145,16 @@ func tick(client *http.Client, cfg *config.Config) error {
 		err = ingest.Send(client, cfg, cfg.Sequence, sample)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	app := sample.ActiveWindow
-	if app == "" {
-		app = "(unknown)"
+	shown := app
+	if shown == "" {
+		shown = "(unknown)"
 	}
-	fmt.Printf("  ✓ seq %d — %s · idle %ds\n", cfg.Sequence, app, sample.IdleSeconds)
-	return cfg.Save()
+	fmt.Printf("  ✓ seq %d — %s · idle %ds\n", cfg.Sequence, shown, sample.IdleSeconds)
+	return app, cfg.Save()
 }
 
 func shotTick(client *http.Client, cfg *config.Config) error {

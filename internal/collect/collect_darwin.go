@@ -15,22 +15,36 @@ import (
 // corresponding field is "".
 func Collect() (Sample, error) {
 	app := frontmostApp()
-	return Sample{ActiveWindow: app, IdleSeconds: idleSeconds(), URL: browserURL(app)}, nil
+	url, title, browser := browserTab(app)
+	return Sample{
+		ActiveWindow: app,
+		IdleSeconds:  idleSeconds(),
+		URL:          url,
+		PageTitle:    title,
+		Browser:      browser,
+	}, nil
 }
 
-// browserURL asks the named browser for its active tab URL via AppleScript.
-// Returns "" for non-browsers or when permission is denied.
-func browserURL(app string) string {
-	var script string
+// browserTab asks the named browser for its active tab URL + title via
+// AppleScript. Returns ("", "", "") for non-browsers or when permission is
+// denied; otherwise also returns the browser app name.
+func browserTab(app string) (url, title, browser string) {
+	var urlScript, titleScript string
 	switch app {
 	case "Google Chrome", "Google Chrome Canary", "Chromium", "Brave Browser",
 		"Microsoft Edge", "Arc", "Vivaldi", "Opera":
-		script = `tell application "` + app + `" to get URL of active tab of front window`
+		urlScript = `tell application "` + app + `" to get URL of active tab of front window`
+		titleScript = `tell application "` + app + `" to get title of active tab of front window`
 	case "Safari", "Safari Technology Preview":
-		script = `tell application "` + app + `" to get URL of front document`
+		urlScript = `tell application "` + app + `" to get URL of front document`
+		titleScript = `tell application "` + app + `" to get name of front document`
 	default:
-		return ""
+		return "", "", ""
 	}
+	return runScript(urlScript), runScript(titleScript), app
+}
+
+func runScript(script string) string {
 	out, err := exec.Command("osascript", "-e", script).Output()
 	if err != nil {
 		return ""

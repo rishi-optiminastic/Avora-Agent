@@ -10,4 +10,8 @@ type Sample struct {
 	ActiveWindow string
 	IdleSeconds  int
 	URL          string
+	// PageTitle is the active browser tab's title; Browser is the browser app
+	// name (both "" for non-browsers or when Automation permission is denied).
+	PageTitle string
+	Browser   string
 }
