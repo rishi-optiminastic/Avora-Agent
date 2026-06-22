@@ -28,6 +28,11 @@ type Config struct {
 	Sequence    int    `json:"sequence"`
 	FEBaseURL   string `json:"fe_base_url"`
 	APIBaseURL  string `json:"api_base_url"`
+	// PersonalMode pauses all capture (activity + screenshots) when true. Set
+	// from server mode_* commands and persisted so it survives a restart. The
+	// server also drops anything captured while the employee is in personal
+	// mode, so this is an optimization, not the privacy boundary.
+	PersonalMode bool `json:"personal_mode"`
 }
 
 // Dir is ~/.avora.

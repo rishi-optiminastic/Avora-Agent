@@ -37,6 +37,8 @@ type payload struct {
 	ActiveWindow    *string `json:"active_window,omitempty"`
 	IdleSeconds     int     `json:"idle_seconds"`
 	URL             *string `json:"url,omitempty"`
+	PageTitle       *string `json:"page_title,omitempty"`
+	Browser         *string `json:"browser,omitempty"`
 }
 
 // Send posts one sample. Returns nil on 202, ErrReplay on 409.
@@ -51,6 +53,12 @@ func Send(client *http.Client, cfg *config.Config, sequence int, s collect.Sampl
 	}
 	if s.URL != "" {
 		body.URL = &s.URL
+	}
+	if s.PageTitle != "" {
+		body.PageTitle = &s.PageTitle
+	}
+	if s.Browser != "" {
+		body.Browser = &s.Browser
 	}
 
 	raw, err := json.Marshal(body)

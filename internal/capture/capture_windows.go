@@ -8,7 +8,13 @@ import (
 	_ "image/jpeg" // register the JPEG decoder for DecodeConfig
 	"os"
 	"os/exec"
+	"syscall"
 )
+
+// createNoWindow (CREATE_NO_WINDOW) stops Windows from spawning a console window
+// for the PowerShell child. Without it a cmd window flashes on every capture —
+// and gets caught in the screenshot itself.
+const createNoWindow = 0x08000000
 
 // Capture grabs the virtual screen via PowerShell + System.Drawing and returns
 // the JPEG bytes. (Shelling out mirrors the macOS approach and avoids hand-rolled
@@ -30,6 +36,7 @@ func Capture() (Shot, error) {
 		`$bmp.Save('` + path + `',[System.Drawing.Imaging.ImageFormat]::Jpeg); ` +
 		`$g.Dispose(); $bmp.Dispose()`
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	if err := cmd.Run(); err != nil {
 		return Shot{}, err
 	}
