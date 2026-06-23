@@ -16,9 +16,11 @@ import (
 // and gets caught in the screenshot itself.
 const createNoWindow = 0x08000000
 
-// Capture grabs the virtual screen via PowerShell + System.Drawing and returns
-// the JPEG bytes. (Shelling out mirrors the macOS approach and avoids hand-rolled
-// GDI syscalls.) Dimensions are read back from the encoded image.
+// Capture grabs the virtual screen via PowerShell + System.Drawing, downscales
+// the longest side to ~1600px (HighQualityBicubic) and saves JPEG at quality 65.
+// Downscaling matters: a raw multi-monitor capture can be many megabytes and get
+// rejected by the ingest size cap (which is why captures were silently failing).
+// Dimensions are read back from the encoded image.
 func Capture() (Shot, error) {
 	f, err := os.CreateTemp("", "avora-shot-*.jpg")
 	if err != nil {
@@ -28,15 +30,34 @@ func Capture() (Shot, error) {
 	_ = f.Close()
 	defer func() { _ = os.Remove(path) }()
 
-	ps := `Add-Type -AssemblyName System.Windows.Forms,System.Drawing; ` +
-		`$b=[System.Windows.Forms.SystemInformation]::VirtualScreen; ` +
-		`$bmp=New-Object System.Drawing.Bitmap($b.Width,$b.Height); ` +
-		`$g=[System.Drawing.Graphics]::FromImage($bmp); ` +
-		`$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); ` +
-		`$bmp.Save('` + path + `',[System.Drawing.Imaging.ImageFormat]::Jpeg); ` +
-		`$g.Dispose(); $bmp.Dispose()`
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	ps := `$ErrorActionPreference='Stop';` +
+		`Add-Type -AssemblyName System.Windows.Forms,System.Drawing;` +
+		`$vs=[System.Windows.Forms.SystemInformation]::VirtualScreen;` +
+		`$src=New-Object System.Drawing.Bitmap($vs.Width,$vs.Height);` +
+		`$g=[System.Drawing.Graphics]::FromImage($src);` +
+		`$g.CopyFromScreen($vs.Location,[System.Drawing.Point]::Empty,$vs.Size);` +
+		`$g.Dispose();` +
+		`$max=1600.0;` +
+		`$scale=[Math]::Min(1.0,$max/[Math]::Max($vs.Width,$vs.Height));` +
+		`$nw=[Math]::Max(1,[int]($vs.Width*$scale));` +
+		`$nh=[Math]::Max(1,[int]($vs.Height*$scale));` +
+		`$dst=New-Object System.Drawing.Bitmap($nw,$nh);` +
+		`$dg=[System.Drawing.Graphics]::FromImage($dst);` +
+		`$dg.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic;` +
+		`$dg.DrawImage($src,0,0,$nw,$nh);` +
+		`$dg.Dispose();$src.Dispose();` +
+		`$enc=[System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders()|Where-Object{$_.MimeType -eq 'image/jpeg'};` +
+		`$ep=New-Object System.Drawing.Imaging.EncoderParameters(1);` +
+		`$ep.Param[0]=New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality,[int64]65);` +
+		`$dst.Save('` + path + `',$enc,$ep);` +
+		`$dst.Dispose()`
+	cmd := exec.Command(
+		"powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps,
+	)
+	// CREATE_NO_WINDOW alone is unreliable for powershell.exe — pair it with
+	// HideWindow (STARTF_USESHOWWINDOW + SW_HIDE) so no console flashes (and so it
+	// never lands inside the screenshot).
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	if err := cmd.Run(); err != nil {
 		return Shot{}, err
 	}

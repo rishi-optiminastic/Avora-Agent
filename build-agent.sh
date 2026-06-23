@@ -10,11 +10,12 @@
 #   gh release upload v0.1.0 ./dist/* --repo <owner>/<repo> --clobber
 #
 # Set NEXT_PUBLIC_AGENT_REPO=<owner>/<repo> on Vercel so the download page points
-# at that repo's latest release. AVORA_FE_URL defaults to the Vercel app.
+# at that repo's latest release. AVORA_FE_URL defaults to the canonical app domain
+# — it's the host the agent opens for device enrollment ({FE}/agent/enroll).
 set -euo pipefail
 cd "$(dirname "$0")"
 
-FE_URL="${AVORA_FE_URL:-https://avora-fe.vercel.app}"
+FE_URL="${AVORA_FE_URL:-https://avora.optiminastic.com}"
 API_URL="${AVORA_API_URL:?set AVORA_API_URL to your backend host, e.g. https://avora-be.onrender.com}"
 
 LDFLAGS="-s -w \
