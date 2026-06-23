@@ -28,7 +28,29 @@ rm -rf "$OUT" && mkdir -p "$OUT"
 echo "Building with FE=${FE_URL}  API=${API_URL}"
 GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o "$OUT/avora-agent-macos-arm64" ./cmd/avora-agent
 GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "$OUT/avora-agent-macos-intel" ./cmd/avora-agent
-GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "$OUT/avora-agent.exe" ./cmd/avora-agent
+# -H windowsgui → GUI subsystem: no console window when Windows auto-starts the
+# agent at login (the persistent black cmd window). Interactive commands still
+# print via AttachConsole (see cmd/avora-agent/console_windows.go).
+GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS -H windowsgui" -o "$OUT/avora-agent.exe" ./cmd/avora-agent
+
+# macOS Screen Recording permission (TCC) is keyed on the binary's code
+# signature. An UNSIGNED binary changes identity every rebuild, so macOS
+# re-prompts each time. Sign with a STABLE identity so the grant persists across
+# rebuilds: set CODESIGN_IDENTITY to a "Developer ID Application: …" cert (for
+# distribution, also notarize) or a self-signed cert you reuse. Defaults to
+# ad-hoc ("-"), which is enough to run but still re-prompts on each rebuild.
+# (Windows has no such permission — employees on Windows are unaffected.)
+SIGN_ID="${CODESIGN_IDENTITY:--}"
+if command -v codesign >/dev/null 2>&1; then
+  echo "Signing macOS binaries with identity: ${SIGN_ID}"
+  if [ "$SIGN_ID" = "-" ]; then
+    sign() { codesign --force --sign - "$1" || true; }   # ad-hoc (runs, but re-prompts per rebuild)
+  else
+    sign() { codesign --force --timestamp --options runtime --sign "$SIGN_ID" "$1" || true; }
+  fi
+  sign "$OUT/avora-agent-macos-arm64"
+  sign "$OUT/avora-agent-macos-intel"
+fi
 
 echo "Done → $OUT"
 ls -lh "$OUT"

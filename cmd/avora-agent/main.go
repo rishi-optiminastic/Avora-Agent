@@ -22,6 +22,11 @@ import (
 )
 
 func main() {
+	// Built with -H windowsgui (no console window, so the login Run-key
+	// auto-start shows nothing). When a user runs a command from a terminal,
+	// this re-attaches stdout so output is still visible. No-op off Windows.
+	attachParentConsole()
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)

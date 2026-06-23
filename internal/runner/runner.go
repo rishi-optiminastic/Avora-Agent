@@ -20,7 +20,7 @@ import (
 
 const (
 	baseInterval         = 15 * time.Second
-	activityEverySteps   = 4  // ~60s
+	activityEverySteps   = 2  // ~30s
 	screenshotEverySteps = 20 // ~5min
 	// Debounce event-triggered screenshots so rapid app-switching can't spam.
 	eventShotMinInterval = 90 * time.Second
