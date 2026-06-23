@@ -9,8 +9,9 @@ import (
 	"strings"
 )
 
-// maxDimension caps the longest side so uploads stay small (~100–250 KB JPEG).
-const maxDimension = "1280"
+// maxDimension caps the longest side. Kept high enough that OCR can read small
+// text (the EOD context comes from screenshot OCR, not the image itself).
+const maxDimension = "2560"
 
 // Capture grabs the main display via `screencapture`, downscales it with `sips`,
 // and returns JPEG bytes + dimensions. Needs macOS Screen Recording permission.

@@ -10,8 +10,11 @@ import (
 	"unsafe"
 )
 
-// maxDimension caps the longest side so uploads stay small (~150–300 KB JPEG).
-const maxDimension = 1600
+// maxDimension caps the longest side. Kept high (not 1600) so OCR can read small
+// code/UI text — a multi-monitor desktop squished to 1600px is unreadable to
+// Tesseract, which starves the EOD context. ~2560px JPEG ≈ 0.4–1.5 MB, well under
+// the 15 MB ingest cap.
+const maxDimension = 2560
 
 // Win32 / GDI bindings. We capture the screen entirely in-process with BitBlt —
 // no PowerShell child, so there is NO console window that could flash or get
@@ -132,7 +135,7 @@ func Capture() (Shot, error) {
 	out := downscale(src, maxDimension)
 
 	var jpg bytes.Buffer
-	if err := jpeg.Encode(&jpg, out, &jpeg.Options{Quality: 65}); err != nil {
+	if err := jpeg.Encode(&jpg, out, &jpeg.Options{Quality: 78}); err != nil {
 		return Shot{}, err
 	}
 	return Shot{JPEG: jpg.Bytes(), Width: out.Rect.Dx(), Height: out.Rect.Dy()}, nil
