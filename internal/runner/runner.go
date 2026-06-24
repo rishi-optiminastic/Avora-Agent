@@ -16,12 +16,14 @@ import (
 	"avora-agent/internal/config"
 	"avora-agent/internal/ingest"
 	"avora-agent/internal/notify"
+	"avora-agent/internal/selfupdate"
 )
 
 const (
 	baseInterval         = 15 * time.Second
-	activityEverySteps   = 2  // ~30s
-	screenshotEverySteps = 20 // ~5min
+	activityEverySteps   = 2   // ~30s
+	screenshotEverySteps = 20  // ~5min
+	updateEverySteps     = 960 // ~4h — check for a newer release + self-update
 	// Debounce event-triggered screenshots so rapid app-switching can't spam.
 	eventShotMinInterval = 90 * time.Second
 )
@@ -34,6 +36,12 @@ func Run(cfg *config.Config) error {
 	var lastApp string
 	var lastEventShot time.Time
 	for step := 0; ; step++ {
+		// Self-update on startup (step 0) and every few hours: if a newer release
+		// is published, this swaps the binary and restarts — so a fix ships to
+		// every machine on its own, no reinstall. Best-effort; never blocks work.
+		if step%updateEverySteps == 0 {
+			selfupdate.CheckAndApply(config.Version(), config.UpdateRepo())
+		}
 		// Always poll commands first — even in personal mode, so a "resume"
 		// (mode_work) command can turn capture back on.
 		if err := handlePings(client, cfg); revoked(err) {
@@ -104,6 +112,9 @@ func handlePings(client *http.Client, cfg *config.Config) error {
 			setMode(cfg, true)
 		case "mode_work":
 			setMode(cfg, false)
+		case "update":
+			fmt.Println("  ⬆️  update requested")
+			selfupdate.CheckAndApply(config.Version(), config.UpdateRepo())
 		default:
 			notify.Ping(p.Message)
 			fmt.Printf("  🔔 ping received: %s\n", p.Message)

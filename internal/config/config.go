@@ -13,14 +13,27 @@ import (
 // Overridable at build time so release binaries ship pointing at production:
 //
 //	go build -ldflags "-X avora-agent/internal/config.defaultFEURL=https://… \
-//	                   -X avora-agent/internal/config.defaultAPIURL=https://…"
+//	                   -X avora-agent/internal/config.defaultAPIURL=https://… \
+//	                   -X avora-agent/internal/config.version=v0.2.0 \
+//	                   -X avora-agent/internal/config.updateRepo=owner/repo"
 //
 // Left at localhost for local dev. AVORA_FE_URL / AVORA_API_URL still override
 // at runtime.
 var (
 	defaultFEURL  = "http://localhost:3000"
 	defaultAPIURL = "http://localhost:8000"
+	// version is this build's release tag; "dev" disables self-update (local
+	// builds never try to replace themselves). updateRepo is the GitHub
+	// "owner/repo" whose latest release hosts the binaries (empty = no updates).
+	version    = "dev"
+	updateRepo = ""
 )
+
+// Version is the baked build tag (e.g. "v0.2.0", or "dev" locally).
+func Version() string { return version }
+
+// UpdateRepo is the GitHub repo ("owner/repo") hosting agent releases, or "".
+func UpdateRepo() string { return updateRepo }
 
 // Config is the on-disk agent state.
 type Config struct {

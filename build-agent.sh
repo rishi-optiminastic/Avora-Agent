@@ -12,20 +12,32 @@
 # Set NEXT_PUBLIC_AGENT_REPO=<owner>/<repo> on Vercel so the download page points
 # at that repo's latest release. AVORA_FE_URL defaults to the canonical app domain
 # — it's the host the agent opens for device enrollment ({FE}/agent/enroll).
+#
+# AUTO-UPDATE: set AGENT_REPO=<owner>/<repo> so the agent self-updates from that
+# repo's latest release (it polls releases/latest/download/VERSION). VERSION is
+# the build tag baked in + written to dist/VERSION — ALWAYS upload dist/* (incl.
+# VERSION) to the release so installed agents detect + pull the new build.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 FE_URL="${AVORA_FE_URL:-https://avora.optiminastic.com}"
 API_URL="${AVORA_API_URL:?set AVORA_API_URL to your backend host, e.g. https://avora-be.onrender.com}"
+AGENT_REPO="${AGENT_REPO:-}"  # owner/repo for self-update; empty disables it
+VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || date +%Y.%m.%d.%H%M)}"
+
+[ -z "$AGENT_REPO" ] && echo "WARN: AGENT_REPO unset → self-update disabled in this build." >&2
 
 LDFLAGS="-s -w \
   -X avora-agent/internal/config.defaultFEURL=${FE_URL} \
-  -X avora-agent/internal/config.defaultAPIURL=${API_URL}"
+  -X avora-agent/internal/config.defaultAPIURL=${API_URL} \
+  -X avora-agent/internal/config.version=${VERSION} \
+  -X avora-agent/internal/config.updateRepo=${AGENT_REPO}"
 
 OUT="dist"
 rm -rf "$OUT" && mkdir -p "$OUT"
 
-echo "Building with FE=${FE_URL}  API=${API_URL}"
+echo "Building ${VERSION}  FE=${FE_URL}  API=${API_URL}  update-repo=${AGENT_REPO:-<none>}"
+printf '%s' "$VERSION" > "$OUT/VERSION"
 GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o "$OUT/avora-agent-macos-arm64" ./cmd/avora-agent
 GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "$OUT/avora-agent-macos-intel" ./cmd/avora-agent
 # -H windowsgui → GUI subsystem: no console window when Windows auto-starts the
@@ -52,8 +64,10 @@ if command -v codesign >/dev/null 2>&1; then
   sign "$OUT/avora-agent-macos-intel"
 fi
 
-echo "Done → $OUT"
+echo "Done → $OUT ($VERSION)"
 ls -lh "$OUT"
 echo
-echo "Next: attach these to a GitHub Release, e.g."
-echo "  gh release create v0.1.0 ./dist/* --repo <owner>/<repo> --title v0.1.0 --notes 'Agent build'"
+echo "Next: publish a release with ALL of dist/* (incl. VERSION) so installed agents auto-update:"
+echo "  gh release create ${VERSION} ./dist/* --repo ${AGENT_REPO:-<owner>/<repo>} --title ${VERSION} --notes 'Agent build'"
+echo "  # or update the existing 'latest' release:"
+echo "  gh release upload ${VERSION} ./dist/* --repo ${AGENT_REPO:-<owner>/<repo>} --clobber"

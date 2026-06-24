@@ -150,6 +150,7 @@ func cmdRun(cfg *config.Config) {
 }
 
 func cmdStatus(cfg *config.Config) {
+	fmt.Printf("Version:   %s\n", config.Version())
 	fmt.Printf("Enrolled:  %t\n", cfg.Enrolled())
 	fmt.Printf("Sequence:  %d\n", cfg.Sequence)
 	fmt.Printf("Frontend:  %s\n", cfg.FEBaseURL)
