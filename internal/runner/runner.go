@@ -32,52 +32,78 @@ const (
 // in which case it de-enrolls and exits cleanly.
 func Run(cfg *config.Config) error {
 	client := &http.Client{Timeout: 20 * time.Second}
+	// Clear any stale personal-mode pause persisted by an older build, so a
+	// previously-paused machine resumes (the toggle was removed; capture is
+	// always on) and never sits looking offline.
+	if cfg.PersonalMode {
+		cfg.PersonalMode = false
+		_ = cfg.Save()
+	}
 	fmt.Println("Avora agent running — Ctrl-C to stop.")
 	var lastApp string
 	var lastEventShot time.Time
 	for step := 0; ; step++ {
-		// Self-update on startup (step 0) and every few hours: if a newer release
-		// is published, this swaps the binary and restarts — so a fix ships to
-		// every machine on its own, no reinstall. Best-effort; never blocks work.
-		if step%updateEverySteps == 0 {
-			selfupdate.CheckAndApply(config.Version(), config.UpdateRepo())
-		}
-		// Always poll commands first — even in personal mode, so a "resume"
-		// (mode_work) command can turn capture back on.
-		if err := handlePings(client, cfg); revoked(err) {
+		// Each iteration runs inside a recover so a panic deep in a platform
+		// syscall (collect/capture) can't take the whole agent down — without
+		// this, one bad sample turns a Windows machine offline until the next
+		// login. A revoked token is the only intentional exit.
+		if runStep(client, cfg, step, &lastApp, &lastEventShot) {
 			return deauthorize(cfg)
 		}
-		// Personal mode pauses all capture; the server drops it anyway, but we
-		// don't even collect/send it.
-		if !cfg.PersonalMode {
-			if step%activityEverySteps == 0 {
-				app, err := tick(client, cfg)
-				if revoked(err) {
-					return deauthorize(cfg)
-				} else if err != nil {
-					fmt.Println("  warn: " + err.Error())
-				}
-				// Event-triggered screenshot: the foreground app changed.
-				if app != "" && app != lastApp {
-					lastApp = app
-					if time.Since(lastEventShot) > eventShotMinInterval {
-						if err := shotTick(client, cfg); err == nil {
-							lastEventShot = time.Now()
-						}
-					}
-				}
-			}
-			if step%screenshotEverySteps == 0 {
-				if err := shotTick(client, cfg); revoked(err) {
-					return deauthorize(cfg)
-				} else if err != nil {
-					fmt.Println("  warn (screenshot): " + err.Error())
-				}
-				lastEventShot = time.Now()
-			}
-		}
+		// The sleep is outside the recovered step so a persistent panic backs off
+		// (one attempt per tick) instead of spinning the CPU.
 		time.Sleep(baseInterval)
 	}
+}
+
+// runStep performs one loop iteration and reports whether the device was revoked
+// (the caller then de-enrolls and exits). Any panic is recovered and logged so
+// the loop survives and tries again on the next tick.
+func runStep(client *http.Client, cfg *config.Config, step int, lastApp *string, lastEventShot *time.Time) (revokedNow bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("  warn: recovered from panic, continuing: %v\n", r)
+		}
+	}()
+
+	// Self-update on startup (step 0) and every few hours: if a newer release
+	// is published, this swaps the binary and restarts — so a fix ships to
+	// every machine on its own, no reinstall. Best-effort; never blocks work.
+	if step%updateEverySteps == 0 {
+		selfupdate.CheckAndApply(config.Version(), config.UpdateRepo())
+	}
+	// Poll inbound commands (capture/ping/update) first.
+	if err := handlePings(client, cfg); revoked(err) {
+		return true
+	}
+	// Capture is always on (work mode) — the personal-mode pause was removed, so a
+	// machine can never get stuck paused-and-looking-offline.
+	if step%activityEverySteps == 0 {
+		app, err := tick(client, cfg)
+		if revoked(err) {
+			return true
+		} else if err != nil {
+			fmt.Println("  warn: " + err.Error())
+		}
+		// Event-triggered screenshot: the foreground app changed.
+		if app != "" && app != *lastApp {
+			*lastApp = app
+			if time.Since(*lastEventShot) > eventShotMinInterval {
+				if err := shotTick(client, cfg); err == nil {
+					*lastEventShot = time.Now()
+				}
+			}
+		}
+	}
+	if step%screenshotEverySteps == 0 {
+		if err := shotTick(client, cfg); revoked(err) {
+			return true
+		} else if err != nil {
+			fmt.Println("  warn (screenshot): " + err.Error())
+		}
+		*lastEventShot = time.Now()
+	}
+	return false
 }
 
 func revoked(err error) bool { return errors.Is(err, ingest.ErrUnauthorized) }

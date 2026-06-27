@@ -81,7 +81,11 @@ func Load() (*Config, error) {
 	switch data, err := os.ReadFile(p); {
 	case err == nil:
 		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, err
+			// Corrupt/partial state — e.g. a crash or kill left the file half-written
+			// (null bytes → "invalid character '\x00'"). Don't brick every command:
+			// start from a fresh config. The next Save() rewrites it cleanly; the
+			// device just needs to re-enroll.
+			cfg = &Config{}
 		}
 	case !os.IsNotExist(err):
 		return nil, err
@@ -98,7 +102,10 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// Save writes the config back with 0600 perms (0700 dir).
+// Save writes the config back with 0600 perms (0700 dir). The write is atomic —
+// a full write to a temp file, then a rename over the target — so a crash or kill
+// can only ever leave the old file or the temp, never a half-written agent.json
+// full of null bytes. (os.Rename replaces the destination on POSIX and Windows.)
 func (c *Config) Save() error {
 	dir, err := Dir()
 	if err != nil {
@@ -111,7 +118,16 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "agent.json"), data, 0o600)
+	final := filepath.Join(dir, "agent.json")
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Enrolled reports whether a device token is present.

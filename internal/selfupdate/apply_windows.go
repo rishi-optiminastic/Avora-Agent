@@ -26,11 +26,16 @@ func apply(current, newPath string) error {
 	return nil
 }
 
-// restart launches the freshly-swapped binary (windowless) and exits, so the
-// new version takes over. The Run-key autostart still points at the same path.
-func restart(exe string) {
+// restart launches the freshly-swapped binary (windowless) and exits, so the new
+// version takes over. The autostart task still points at the same path. If the
+// launch fails it returns the error WITHOUT exiting, so the caller can keep the
+// current process alive instead of leaving the machine with no agent running.
+func restart(exe string) error {
 	cmd := exec.Command(exe, "run")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
-	_ = cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
 	os.Exit(0)
+	return nil // unreachable
 }

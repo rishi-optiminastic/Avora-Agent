@@ -15,8 +15,13 @@ func apply(current, newPath string) error {
 }
 
 // restart re-execs the process image with the new binary — a clean in-place
-// restart that keeps the same PID. Falls through to exit if exec fails.
-func restart(exe string) {
-	_ = syscall.Exec(exe, []string{exe, "run"}, os.Environ())
-	os.Exit(0)
+// restart that keeps the same PID. On success it does not return. If exec fails
+// it returns the error so the caller keeps the current process running rather
+// than exiting and relying on a supervisor that may not exist (e.g. Linux XDG
+// autostart has no KeepAlive).
+func restart(exe string) error {
+	if err := syscall.Exec(exe, []string{exe, "run"}, os.Environ()); err != nil {
+		return err
+	}
+	return nil // unreachable on success
 }

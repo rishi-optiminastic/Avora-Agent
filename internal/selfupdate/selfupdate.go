@@ -66,7 +66,13 @@ func CheckAndApply(current, repo string) {
 		return
 	}
 	fmt.Printf("  ⬆️  updated %s → %s, restarting\n", current, latest)
-	restart(exe) // platform-specific; replaces/relaunches the process and exits
+	// On success restart() does not return (it replaces/relaunches the process).
+	// If the relaunch fails, do NOT exit — keep the current process running so the
+	// machine doesn't go dark. The new binary is already in place and will be
+	// picked up on the next normal start (login or the autostart supervisor).
+	if err := restart(exe); err != nil {
+		fmt.Println("  warn: self-update relaunch failed, staying on current version: " + err.Error())
+	}
 }
 
 func fetchText(url string) (string, error) {
