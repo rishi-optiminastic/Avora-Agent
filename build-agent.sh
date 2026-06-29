@@ -3,7 +3,8 @@
 # attach them to a GitHub Release (the download page links to the repo's latest
 # release).
 #
-#   AVORA_API_URL=https://avora-be.onrender.com ./build-agent.sh
+#   ./build-agent.sh   # API defaults to https://api.avora.optiminastic.com
+#   AVORA_API_URL=https://other-host ./build-agent.sh   # override
 #   # then, with the GitHub CLI:
 #   gh release create v0.1.0 ./dist/* --repo <owner>/<repo> --title v0.1.0 --notes "Agent build"
 #   # (or upload to an existing release):
@@ -21,7 +22,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 FE_URL="${AVORA_FE_URL:-https://avora.optiminastic.com}"
-API_URL="${AVORA_API_URL:?set AVORA_API_URL to your backend host, e.g. https://avora-be.onrender.com}"
+API_URL="${AVORA_API_URL:-https://api.avora.optiminastic.com}"
 AGENT_REPO="${AGENT_REPO:-}"  # owner/repo for self-update; empty disables it
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || date +%Y.%m.%d.%H%M)}"
 
