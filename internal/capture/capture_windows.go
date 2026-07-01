@@ -6,15 +6,18 @@ import (
 	"bytes"
 	"image"
 	"image/jpeg"
+	"sync"
 	"syscall"
 	"unsafe"
 )
 
-// maxDimension caps the longest side. Kept high (not 1600) so OCR can read small
-// code/UI text — a multi-monitor desktop squished to 1600px is unreadable to
-// Tesseract, which starves the EOD context. ~2560px JPEG ≈ 0.4–1.5 MB, well under
-// the 15 MB ingest cap.
-const maxDimension = 2560
+const (
+	// maxDimension caps the longest side of the COMBINED virtual desktop. Kept
+	// high so a multi-monitor desktop keeps enough per-screen resolution for OCR
+	// to read small code/UI text (the worker crops + upscales each monitor).
+	maxDimension = 3200
+	jpegQuality  = 90
+)
 
 // Win32 / GDI bindings. We capture the screen entirely in-process with BitBlt —
 // no PowerShell child, so there is NO console window that could flash or get
@@ -23,16 +26,17 @@ var (
 	user32 = syscall.NewLazyDLL("user32.dll")
 	gdi32  = syscall.NewLazyDLL("gdi32.dll")
 
-	procGetDC              = user32.NewProc("GetDC")
-	procReleaseDC          = user32.NewProc("ReleaseDC")
-	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
-	procCreateCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
-	procCreateCompatibleBM = gdi32.NewProc("CreateCompatibleBitmap")
-	procSelectObject       = gdi32.NewProc("SelectObject")
-	procBitBlt             = gdi32.NewProc("BitBlt")
-	procGetDIBits          = gdi32.NewProc("GetDIBits")
-	procDeleteObject       = gdi32.NewProc("DeleteObject")
-	procDeleteDC           = gdi32.NewProc("DeleteDC")
+	procGetDC               = user32.NewProc("GetDC")
+	procReleaseDC           = user32.NewProc("ReleaseDC")
+	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
+	procEnumDisplayMonitors = user32.NewProc("EnumDisplayMonitors")
+	procCreateCompatibleDC  = gdi32.NewProc("CreateCompatibleDC")
+	procCreateCompatibleBM  = gdi32.NewProc("CreateCompatibleBitmap")
+	procSelectObject        = gdi32.NewProc("SelectObject")
+	procBitBlt              = gdi32.NewProc("BitBlt")
+	procGetDIBits           = gdi32.NewProc("GetDIBits")
+	procDeleteObject        = gdi32.NewProc("DeleteObject")
+	procDeleteDC            = gdi32.NewProc("DeleteDC")
 )
 
 const (
@@ -62,13 +66,43 @@ type bitmapInfoHeader struct {
 	ClrImportant  uint32
 }
 
+type winRect struct {
+	Left, Top, Right, Bottom int32
+}
+
 func metric(i int) int {
 	v, _, _ := procGetSystemMetrics.Call(uintptr(i))
 	return int(int32(v))
 }
 
+// The EnumDisplayMonitors callback is allocated ONCE for the process lifetime —
+// syscall.NewCallback registrations are never freed and are capped, so a fresh
+// one per capture (every few minutes) would eventually exhaust the limit. The
+// agent captures serially, so a package-level slice guarded by a mutex is safe.
+var (
+	enumMu       sync.Mutex
+	enumCollect  []winRect
+	enumCallback = syscall.NewCallback(func(_, _, lprc, _ uintptr) uintptr {
+		enumCollect = append(enumCollect, *(*winRect)(unsafe.Pointer(lprc)))
+		return 1 // continue enumeration
+	})
+)
+
+// enumMonitors returns each physical monitor's rectangle in virtual-desktop
+// coordinates (best-effort; empty on failure → the whole image is one screen).
+func enumMonitors() []winRect {
+	enumMu.Lock()
+	defer enumMu.Unlock()
+	enumCollect = nil
+	procEnumDisplayMonitors.Call(0, 0, enumCallback, 0)
+	out := make([]winRect, len(enumCollect))
+	copy(out, enumCollect)
+	return out
+}
+
 // Capture grabs the whole virtual screen via GDI BitBlt, converts the BGRA
-// device bits to RGBA, downscales to maxDimension, and returns a JPEG.
+// device bits to RGBA, downscales (area averaging) to maxDimension, and returns
+// a JPEG plus per-monitor rectangles within it.
 func Capture() (Shot, error) {
 	x := metric(smXVirtualScreen)
 	y := metric(smYVirtualScreen)
@@ -80,6 +114,18 @@ func Capture() (Shot, error) {
 	}
 	if w <= 0 || h <= 0 {
 		return Shot{}, syscall.EINVAL
+	}
+
+	// Monitor rects relative to the captured origin (the virtual-screen top-left),
+	// so they index into the combined image. Negative/odd offsets become 0-based.
+	rects := make([]Rect, 0, 4)
+	for _, m := range enumMonitors() {
+		rects = append(rects, Rect{
+			X: int(m.Left) - x,
+			Y: int(m.Top) - y,
+			W: int(m.Right - m.Left),
+			H: int(m.Bottom - m.Top),
+		})
 	}
 
 	screenDC, _, _ := procGetDC.Call(0)
@@ -132,50 +178,17 @@ func Capture() (Shot, error) {
 		buf[i+3] = 0xff
 	}
 	src := &image.RGBA{Pix: buf, Stride: w * 4, Rect: image.Rect(0, 0, w, h)}
-	out := downscale(src, maxDimension)
+	out, scale := downscaleArea(src, maxDimension)
+	rects = scaleRects(rects, scale)
 
 	var jpg bytes.Buffer
-	if err := jpeg.Encode(&jpg, out, &jpeg.Options{Quality: 78}); err != nil {
+	if err := jpeg.Encode(&jpg, out, &jpeg.Options{Quality: jpegQuality}); err != nil {
 		return Shot{}, err
 	}
-	return Shot{JPEG: jpg.Bytes(), Width: out.Rect.Dx(), Height: out.Rect.Dy()}, nil
-}
-
-// downscale shrinks src so its longest side is <= max (nearest-neighbor, no
-// deps). Returns src unchanged when it already fits.
-func downscale(src *image.RGBA, max int) *image.RGBA {
-	w, h := src.Rect.Dx(), src.Rect.Dy()
-	longest := w
-	if h > w {
-		longest = h
-	}
-	if longest <= max {
-		return src
-	}
-	scale := float64(max) / float64(longest)
-	nw := int(float64(w) * scale)
-	nh := int(float64(h) * scale)
-	if nw < 1 {
-		nw = 1
-	}
-	if nh < 1 {
-		nh = 1
-	}
-	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
-	for yy := 0; yy < nh; yy++ {
-		sy := int(float64(yy) / scale)
-		if sy >= h {
-			sy = h - 1
-		}
-		for xx := 0; xx < nw; xx++ {
-			sx := int(float64(xx) / scale)
-			if sx >= w {
-				sx = w - 1
-			}
-			di := dst.PixOffset(xx, yy)
-			si := src.PixOffset(sx, sy)
-			copy(dst.Pix[di:di+4], src.Pix[si:si+4])
-		}
-	}
-	return dst
+	return Shot{
+		JPEG:     jpg.Bytes(),
+		Width:    out.Rect.Dx(),
+		Height:   out.Rect.Dy(),
+		Monitors: rects,
+	}, nil
 }

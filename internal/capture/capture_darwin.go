@@ -3,58 +3,81 @@
 package capture
 
 import (
+	"bytes"
+	"errors"
+	"image"
+	"image/jpeg"
 	"os"
 	"os/exec"
-	"strconv"
-	"strings"
 )
 
-// maxDimension caps the longest side. Kept high enough that OCR can read small
-// text (the EOD context comes from screenshot OCR, not the image itself).
-const maxDimension = "2560"
+const (
+	// maxDimension caps the longest side of the COMBINED (all-monitors) image.
+	// Kept high so each monitor keeps enough resolution for OCR to read small
+	// code/UI text; the per-monitor OCR crop is upscaled again server-side.
+	maxDimension = 3200
+	jpegQuality  = 90
+	// Capture up to this many displays. `screencapture` writes one file per
+	// display in order; extra paths for absent displays are left empty.
+	maxDisplays = 4
+)
 
-// Capture grabs the main display via `screencapture`, downscales it with `sips`,
-// and returns JPEG bytes + dimensions. Needs macOS Screen Recording permission.
+// Capture grabs EVERY display via `screencapture` (one file per screen),
+// composes them side by side into one image, downscales with area averaging,
+// and returns JPEG bytes + per-monitor rectangles. Needs macOS Screen Recording
+// permission. Previously only the main display was captured, so work on a second
+// monitor was invisible — this fixes that.
 func Capture() (Shot, error) {
-	f, err := os.CreateTemp("", "avora-shot-*.jpg")
-	if err != nil {
+	paths := make([]string, 0, maxDisplays)
+	for i := 0; i < maxDisplays; i++ {
+		f, err := os.CreateTemp("", "avora-shot-*.jpg")
+		if err != nil {
+			return Shot{}, err
+		}
+		name := f.Name()
+		_ = f.Close()
+		defer func(p string) { _ = os.Remove(p) }(name)
+		paths = append(paths, name)
+	}
+
+	// -x: silent (no shutter sound), -t jpg: JPEG, one file per display.
+	args := append([]string{"-x", "-t", "jpg"}, paths...)
+	if err := exec.Command("screencapture", args...).Run(); err != nil {
 		return Shot{}, err
 	}
-	path := f.Name()
-	_ = f.Close()
-	defer func() { _ = os.Remove(path) }()
 
-	// -x: silent (no shutter sound), -t jpg: JPEG, main display.
-	if err := exec.Command("screencapture", "-x", "-t", "jpg", path).Run(); err != nil {
-		return Shot{}, err
-	}
-	_ = exec.Command("sips", "-Z", maxDimension, path).Run() // downscale in place
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Shot{}, err
-	}
-	w, h := dimensions(path)
-	return Shot{JPEG: data, Width: w, Height: h}, nil
-}
-
-func dimensions(path string) (int, int) {
-	out, err := exec.Command("sips", "-g", "pixelWidth", "-g", "pixelHeight", path).Output()
-	if err != nil {
-		return 0, 0
-	}
-	var w, h int
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
+	var imgs []image.Image
+	for _, p := range paths {
+		info, err := os.Stat(p) // absent displays leave the temp file empty
+		if err != nil || info.Size() == 0 {
 			continue
 		}
-		switch fields[0] {
-		case "pixelWidth":
-			w, _ = strconv.Atoi(fields[1])
-		case "pixelHeight":
-			h, _ = strconv.Atoi(fields[1])
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
 		}
+		im, err := jpeg.Decode(bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+		imgs = append(imgs, im)
 	}
-	return w, h
+	if len(imgs) == 0 {
+		return Shot{}, errors.New("screencapture produced no images")
+	}
+
+	canvas, rects := composeHorizontal(imgs)
+	out, scale := downscaleArea(canvas, maxDimension)
+	rects = scaleRects(rects, scale)
+
+	var jpg bytes.Buffer
+	if err := jpeg.Encode(&jpg, out, &jpeg.Options{Quality: jpegQuality}); err != nil {
+		return Shot{}, err
+	}
+	return Shot{
+		JPEG:     jpg.Bytes(),
+		Width:    out.Rect.Dx(),
+		Height:   out.Rect.Dy(),
+		Monitors: rects,
+	}, nil
 }
