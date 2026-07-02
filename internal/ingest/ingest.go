@@ -158,6 +158,16 @@ func SendScreenshot(client *http.Client, cfg *config.Config, shot capture.Shot) 
 	req.Header.Set("X-Captured-At", time.Now().UTC().Format(time.RFC3339))
 	req.Header.Set("X-Width", strconv.Itoa(shot.Width))
 	req.Header.Set("X-Height", strconv.Itoa(shot.Height))
+	// Per-monitor rectangles within the combined image, "x,y,w,h;…" — lets the
+	// backend OCR each screen separately. Metadata only (unsigned, like W/H); the
+	// server re-validates it against the image bounds.
+	if len(shot.Monitors) > 0 {
+		parts := make([]string, len(shot.Monitors))
+		for i, m := range shot.Monitors {
+			parts[i] = fmt.Sprintf("%d,%d,%d,%d", m.X, m.Y, m.W, m.H)
+		}
+		req.Header.Set("X-Monitors", strings.Join(parts, ";"))
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
