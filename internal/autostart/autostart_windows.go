@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"unicode/utf16"
 )
 
@@ -15,9 +14,6 @@ const (
 	taskName  = `AvoraAgent`
 	legacyKey = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 	legacyVal = "AvoraAgent"
-	// DETACHED_PROCESS — the started agent has no console and survives the
-	// terminal that launched it closing.
-	detachedProcess = 0x00000008
 )
 
 // Enable registers a per-user Scheduled Task that launches the agent at logon
@@ -26,7 +22,7 @@ const (
 // relaunches the agent if it has crashed or been killed, while refusing to start
 // a second copy when one is already running. This is the Windows equivalent of
 // launchd's KeepAlive on macOS. No admin rights are needed (it runs as the
-// logged-in user). It then starts the agent immediately, detached.
+// logged-in user).
 func Enable(execPath string) error {
 	// Drop any legacy Run-key autostart from older installs so the agent isn't
 	// launched twice (once by the key, once by the task).
@@ -47,11 +43,17 @@ func Enable(execPath string) error {
 		return err
 	}
 
-	// Start now rather than waiting for the next logon; the task's IgnoreNew
-	// policy means the logon/repeat triggers won't spawn a duplicate.
-	cmd := exec.Command(execPath, "run")
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: detachedProcess}
-	return cmd.Start()
+	// Kick it off now rather than waiting for the next logon — install typically
+	// runs mid-session, and a LogonTrigger only fires on a *future* logon.
+	// Best-effort: the task's own RegistrationTrigger (below) fires on its own
+	// moments after /create succeeds, so this is a fast path, not the only path.
+	// Going through schtasks instead of spawning the process ourselves matters:
+	// Task Scheduler then tracks the instance, so IgnoreNew correctly stops the
+	// other triggers from spawning a duplicate, and the process isn't a child of
+	// this installer's console/job — it survives the terminal being closed right
+	// after "install" finishes, which a raw detached child process would not.
+	_ = exec.Command("schtasks", "/run", "/tn", taskName).Run()
+	return nil
 }
 
 // Disable removes the Scheduled Task (and any legacy Run-key entry).
@@ -61,8 +63,11 @@ func Disable() error {
 }
 
 // taskXML builds the Task Scheduler definition. Key settings:
-//   - LogonTrigger with an indefinite 3-minute Repetition: re-checks while the
-//     user is logged on, so a dead agent is back within ~3 min, no reboot needed.
+//   - RegistrationTrigger with an indefinite 3-minute Repetition: fires moments
+//     after /create succeeds and keeps re-checking regardless of logon state, so
+//     a mid-session install (the common case) or a later crash self-heals within
+//     ~3 min without waiting for the user to log out and back in.
+//   - LogonTrigger with the same Repetition: covers future fresh logons too.
 //   - MultipleInstancesPolicy=IgnoreNew: the repeats never start a second copy.
 //   - RestartOnFailure: covers a fast crash on startup.
 //   - ExecutionTimeLimit=PT0S and StopIfGoingOnBatteries=false: never auto-killed.
@@ -73,6 +78,13 @@ func taskXML(execPath string) string {
     <Description>Avora activity agent — keeps running and restarts automatically if it stops.</Description>
   </RegistrationInfo>
   <Triggers>
+    <RegistrationTrigger>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT3M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </RegistrationTrigger>
     <LogonTrigger>
       <Enabled>true</Enabled>
       <Repetition>

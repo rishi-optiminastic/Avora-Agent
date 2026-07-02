@@ -42,9 +42,22 @@ GOOS=linux   GOARCH=amd64 go build -o bin/avora-agent-linux ./cmd/avora-agent
 export AVORA_FE_URL=https://avora-fe.vercel.app
 export AVORA_API_URL=https://<your-backend-host>
 
+./bin/avora-agent install   # opens the browser to enroll, then runs now +
+                             # at every login (recommended — this is what
+                             # the dashboard's download page tells people to run)
+./bin/avora-agent status    # show enrollment / config
+./bin/avora-agent uninstall # remove auto-start
+```
+
+`install` is the one-step path and starts tracking immediately — don't tell
+people to run `enroll` and `run` separately, since `run` alone doesn't set up
+auto-start and `enroll` alone doesn't start tracking. Those two remain as
+building blocks (`enroll` links the device without starting anything; `run`
+starts the sampling loop in the foreground) for local development below.
+
+```bash
 ./bin/avora-agent enroll    # opens the browser; click "Connect this device"
 ./bin/avora-agent run       # starts tracking; Ctrl-C to stop
-./bin/avora-agent status    # show enrollment / config
 ```
 
 For local development, leave the env vars unset and run `fe` (`pnpm dev`) and
@@ -90,5 +103,6 @@ Screenshot capture uses built-in PowerShell + System.Drawing.
 ## Not yet built
 
 Linux collectors (active app / idle / screenshot — X11 via `xprop`/`xprintidle`/
-`scrot`; Wayland differs), Windows browser-URL capture, and running as a launch
-agent / background service.
+`scrot`; Wayland differs) and Windows browser-URL capture. Running as a launch
+agent / background service is built (`install`, see `internal/autostart`) on
+macOS and Windows; Linux autostart uses an XDG `.desktop` entry.
