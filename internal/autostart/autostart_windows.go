@@ -3,6 +3,7 @@
 package autostart
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,43 @@ func Enable(execPath string) error {
 	// launched twice (once by the key, once by the task).
 	_ = exec.Command("reg", "delete", legacyKey, "/v", legacyVal, "/f").Run()
 
+	// Register a per-user, self-healing logon task. We try the modern
+	// ScheduledTasks PowerShell cmdlets FIRST — they reliably accept the full
+	// settings across every Windows 10/11 build, where the older `schtasks /xml`
+	// import is finicky about its UTF-16 schema and fails with an opaque
+	// `exit status 1` on some machines. If PowerShell is somehow unavailable we
+	// fall back to the /xml import. Both capture their real error output, so a
+	// silent failure can never masquerade as "auto-start enabled".
+	psErr := createViaPowerShell(execPath)
+	if psErr != nil {
+		if xmlErr := createViaXML(execPath); xmlErr != nil {
+			return fmt.Errorf(
+				"could not register auto-start task (powershell: %v; schtasks: %v)",
+				psErr, xmlErr,
+			)
+		}
+	}
+
+	// Confirm the task really exists before reporting success — this is what
+	// turns a silently-failed create into a surfaced error at install time.
+	if err := exec.Command("schtasks", "/query", "/tn", taskName).Run(); err != nil {
+		return fmt.Errorf("auto-start task %q not found after create: %w", taskName, err)
+	}
+
+	// Kick it off now rather than waiting for the next logon — install typically
+	// runs mid-session, and a LogonTrigger only fires on a *future* logon. Going
+	// through schtasks instead of spawning the process ourselves matters: Task
+	// Scheduler then tracks the instance, so IgnoreNew stops a duplicate and the
+	// process isn't a child of this installer's console — it survives the
+	// terminal being closed right after "install", which a detached child would not.
+	_ = exec.Command("schtasks", "/run", "/tn", taskName).Run()
+	return nil
+}
+
+// createViaXML writes the full task definition and imports it, returning the
+// combined schtasks output on failure so the real reason (not a bare exit code)
+// is visible to the installer and logs.
+func createViaXML(execPath string) error {
 	xmlPath := filepath.Join(os.TempDir(), "avora-agent-task.xml")
 	// schtasks /xml expects UTF-16 (with BOM); plain UTF-8 is rejected on some
 	// builds with an opaque "task XML is malformed" error.
@@ -35,25 +73,46 @@ func Enable(execPath string) error {
 		return err
 	}
 	defer func() { _ = os.Remove(xmlPath) }()
-
 	// /f overwrites an existing definition, so re-running install upgrades it.
-	if err := exec.Command(
+	out, err := exec.Command(
 		"schtasks", "/create", "/tn", taskName, "/xml", xmlPath, "/f",
-	).Run(); err != nil {
-		return err
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
-
-	// Kick it off now rather than waiting for the next logon — install typically
-	// runs mid-session, and a LogonTrigger only fires on a *future* logon.
-	// Best-effort: the task's own RegistrationTrigger (below) fires on its own
-	// moments after /create succeeds, so this is a fast path, not the only path.
-	// Going through schtasks instead of spawning the process ourselves matters:
-	// Task Scheduler then tracks the instance, so IgnoreNew correctly stops the
-	// other triggers from spawning a duplicate, and the process isn't a child of
-	// this installer's console/job — it survives the terminal being closed right
-	// after "install" finishes, which a raw detached child process would not.
-	_ = exec.Command("schtasks", "/run", "/tn", taskName).Run()
 	return nil
+}
+
+// createViaPowerShell registers the full self-healing logon task through the
+// modern ScheduledTasks cmdlets — the primary, most reliable path. It carries
+// the same behaviour as the XML task: launch at every logon, a 3-minute
+// repetition so a mid-session install (or a later crash) self-heals without a
+// re-logon, restart-on-failure, never auto-killed on time or battery, and no
+// duplicate instance. `-ExecutionPolicy Bypass` ensures a locked-down policy
+// can't block these inline cmdlets.
+func createViaPowerShell(execPath string) error {
+	script := "$ErrorActionPreference='Stop';" +
+		"$a=New-ScheduledTaskAction -Execute '" + psEscape(execPath) + "' -Argument 'run';" +
+		"$logon=New-ScheduledTaskTrigger -AtLogOn;" +
+		"$heal=New-ScheduledTaskTrigger -Once -At (Get-Date) " +
+		"-RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 3650);" +
+		"$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries " +
+		"-ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) " +
+		"-RestartCount 3 -MultipleInstances IgnoreNew;" +
+		"Register-ScheduledTask -TaskName '" + taskName + "' -Action $a -Trigger $logon,$heal " +
+		"-Settings $s -Force | Out-Null"
+	out, err := exec.Command(
+		"powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// psEscape makes a string safe inside a PowerShell single-quoted literal.
+func psEscape(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 // Disable removes the Scheduled Task (and any legacy Run-key entry).

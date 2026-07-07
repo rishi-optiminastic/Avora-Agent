@@ -44,7 +44,7 @@ func Run(cfg *config.Config, hostname, osName string) (string, error) {
 		"%s/agent/enroll?cb=%d&state=%s&host=%s&os=%s",
 		cfg.FEBaseURL, port, state, url.QueryEscape(hostname), url.QueryEscape(osName),
 	)
-	fmt.Println("Opening your browser to connect this device…")
+	fmt.Println("Opening your browser to connect this device...")
 	fmt.Println("If it doesn't open, visit:\n  " + enrollURL)
 	_ = openBrowser(enrollURL)
 
