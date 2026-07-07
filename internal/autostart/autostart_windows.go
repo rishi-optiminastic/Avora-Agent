@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unicode/utf16"
 )
 
@@ -25,41 +26,74 @@ const (
 // launchd's KeepAlive on macOS. No admin rights are needed (it runs as the
 // logged-in user).
 func Enable(execPath string) error {
-	// Drop any legacy Run-key autostart from older installs so the agent isn't
-	// launched twice (once by the key, once by the task).
+	// Clear any stale legacy Run-key entry up front; we re-add it below only as
+	// the last-resort fallback, so a scheduled task and the key never both fire.
 	_ = exec.Command("reg", "delete", legacyKey, "/v", legacyVal, "/f").Run()
 
-	// Register a per-user, self-healing logon task. We try the modern
+	// 1) Preferred: a per-user, self-healing scheduled task. We try the modern
 	// ScheduledTasks PowerShell cmdlets FIRST — they reliably accept the full
 	// settings across every Windows 10/11 build, where the older `schtasks /xml`
-	// import is finicky about its UTF-16 schema and fails with an opaque
-	// `exit status 1` on some machines. If PowerShell is somehow unavailable we
-	// fall back to the /xml import. Both capture their real error output, so a
-	// silent failure can never masquerade as "auto-start enabled".
+	// import is finicky about its UTF-16 schema. Both capture their real error
+	// output, so a silent failure can never masquerade as "auto-start enabled".
 	psErr := createViaPowerShell(execPath)
+	var xmlErr error
 	if psErr != nil {
-		if xmlErr := createViaXML(execPath); xmlErr != nil {
-			return fmt.Errorf(
-				"could not register auto-start task (powershell: %v; schtasks: %v)",
-				psErr, xmlErr,
-			)
+		xmlErr = createViaXML(execPath)
+	}
+	if psErr == nil || xmlErr == nil {
+		// Confirm the task really exists before reporting success, then start it
+		// now (install runs mid-session; a LogonTrigger only fires on a *future*
+		// logon). Via schtasks so Task Scheduler tracks the instance (IgnoreNew
+		// stops a duplicate) and it survives the installer's terminal closing.
+		if err := exec.Command("schtasks", "/query", "/tn", taskName).Run(); err != nil {
+			return fmt.Errorf("auto-start task %q not found after create: %w", taskName, err)
 		}
+		_ = exec.Command("schtasks", "/run", "/tn", taskName).Run()
+		return nil
 	}
 
-	// Confirm the task really exists before reporting success — this is what
-	// turns a silently-failed create into a surfaced error at install time.
-	if err := exec.Command("schtasks", "/query", "/tn", taskName).Run(); err != nil {
-		return fmt.Errorf("auto-start task %q not found after create: %w", taskName, err)
+	// 2) Fallback for locked-down / managed machines: creating a scheduled task
+	// can be denied outright (group policy or EDR/security software → both APIs
+	// return 0x80070005 ACCESS_DENIED), even for a per-user task. A per-user Run
+	// key writes only to the user's own HKCU hive, which those policies don't
+	// gate, so it's the reliable floor. It launches the agent at every logon (no
+	// KeepAlive, but the runner reconnects on its own); we also start it now
+	// since the key only fires on the *next* logon.
+	if keyErr := createViaRunKey(execPath); keyErr != nil {
+		return fmt.Errorf(
+			"could not register auto-start (scheduled task denied — powershell: %v; schtasks: %v; run key: %v)",
+			psErr, xmlErr, keyErr,
+		)
 	}
-
-	// Kick it off now rather than waiting for the next logon — install typically
-	// runs mid-session, and a LogonTrigger only fires on a *future* logon. Going
-	// through schtasks instead of spawning the process ourselves matters: Task
-	// Scheduler then tracks the instance, so IgnoreNew stops a duplicate and the
-	// process isn't a child of this installer's console — it survives the
-	// terminal being closed right after "install", which a detached child would not.
-	_ = exec.Command("schtasks", "/run", "/tn", taskName).Run()
+	_ = startDetached(execPath)
 	return nil
+}
+
+// createViaRunKey registers autostart via the per-user HKCU Run key — the
+// no-admin, no-task-permission floor for machines that deny scheduled tasks.
+// The exe is built -H windowsgui, so a Run-key launch shows no console window.
+func createViaRunKey(execPath string) error {
+	value := fmt.Sprintf(`"%s" run`, execPath)
+	out, err := exec.Command(
+		"reg", "add", legacyKey, "/v", legacyVal, "/t", "REG_SZ", "/d", value, "/f",
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// startDetached launches the agent for the current session, detached from the
+// installer's console and its job so it keeps running after the terminal closes.
+// Best-effort: the Run key (or task) covers future logons regardless.
+func startDetached(execPath string) error {
+	cmd := exec.Command(execPath, "run")
+	// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x00000008 | 0x00000200 | 0x01000000,
+	}
+	return cmd.Start()
 }
 
 // createViaXML writes the full task definition and imports it, returning the
