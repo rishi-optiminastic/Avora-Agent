@@ -17,18 +17,23 @@ var (
 const attachParentProcess = ^uint32(0)
 
 // attachParentConsole wires stdout/stderr to the launching terminal when there
-// is one. The agent ships as a GUI-subsystem binary (-H windowsgui) so it never
-// owns a console window — that's what kept a black cmd window open at login.
-// When run interactively (install/enroll/status) we still want output, so we
-// attach to the parent console; auto-start at login has no parent console, so
-// AttachConsole fails and the agent stays silently windowless.
-func attachParentConsole() {
+// is one, and reports whether it found one. The agent ships as a GUI-subsystem
+// binary (-H windowsgui) so it never owns a console window — that's what kept a
+// black cmd window open at login. When run from a terminal (install/enroll/
+// status) we still want output, so we attach to the parent console.
+//
+// A false return means nobody can see stdout: launched from Explorer by a
+// double-click, or started by the login task. The caller talks in dialogs
+// instead, because printing into the void is how a double-click came to look
+// like nothing happened at all.
+func attachParentConsole() bool {
 	r, _, _ := procAttachConsole.Call(uintptr(attachParentProcess))
 	if r == 0 {
-		return
+		return false
 	}
 	if out, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
 		os.Stdout = out
 		os.Stderr = out
 	}
+	return true
 }
