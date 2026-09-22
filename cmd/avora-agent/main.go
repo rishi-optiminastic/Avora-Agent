@@ -28,6 +28,11 @@ import (
 var hasConsole = true
 
 func main() {
+	// Before anything else: DPI awareness is fixed for a process at the first
+	// window or device context it touches, and the screen capture depends on it
+	// (see dpi_windows.go). No-op off Windows.
+	setDPIAware()
+
 	// Built with -H windowsgui (no console window, so the login auto-start shows
 	// nothing). When a user runs a command from a terminal, this re-attaches
 	// stdout so output is still visible. Always true off Windows.
