@@ -24,7 +24,11 @@ cd "$(dirname "$0")"
 
 FE_URL="${AVORA_FE_URL:-https://avora.optiminastic.com}"
 API_URL="${AVORA_API_URL:-https://api.avora.optiminastic.com}"
-AGENT_REPO="${AGENT_REPO:-}"  # owner/repo for self-update; empty disables it
+# owner/repo installed agents update from. Defaults to the company repo: a
+# release built without it ships agents that can never update again (v0.7.0
+# went out that way). Set AGENT_REPO=none only for a deliberate local build.
+AGENT_REPO="${AGENT_REPO:-rishi-optiminastic/Avora-Agent}"
+[ "$AGENT_REPO" = "none" ] && AGENT_REPO=""
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || date +%Y.%m.%d.%H%M)}"
 
 [ -z "$AGENT_REPO" ] && echo "WARN: AGENT_REPO unset → self-update disabled in this build." >&2
