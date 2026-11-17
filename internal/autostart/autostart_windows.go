@@ -105,7 +105,10 @@ func Enable(execPath string) error {
 // no-admin, no-task-permission floor for machines that deny scheduled tasks.
 // The exe is built -H windowsgui, so a Run-key launch shows no console window.
 func createViaRunKey(execPath string) error {
-	value := fmt.Sprintf(`"%s" run`, execPath)
+	// `supervise`, not `run`: the Run key fires once per logon and nothing
+	// watches what it started, so the supervisor is what restarts the agent
+	// after a crash or a watchdog exit on these machines.
+	value := runKeyValue(execPath)
 	out, err := runBounded(
 		"reg", "add", legacyKey, "/v", legacyVal, "/t", "REG_SZ", "/d", value, "/f",
 	)
@@ -115,11 +118,11 @@ func createViaRunKey(execPath string) error {
 	return nil
 }
 
-// startDetached launches the agent for the current session, detached from the
+// startDetached launches the supervisor (and through it the agent) for the current session, detached from the
 // installer's console and its job so it keeps running after the terminal closes.
 // Best-effort: the Run key (or task) covers future logons regardless.
 func startDetached(execPath string) error {
-	cmd := exec.Command(execPath, "run")
+	cmd := exec.Command(execPath, "supervise")
 	// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
@@ -281,6 +284,46 @@ func utf16LE(s string) []byte {
 	b = append(b, 0xFF, 0xFE) // BOM
 	for _, r := range u {
 		b = append(b, byte(r), byte(r>>8))
+	}
+	return b
+}
+
+func runKeyValue(execPath string) string { return fmt.Sprintf(`"%s" supervise`, execPath) }
+
+// HideChild keeps a supervised child windowless, like the Run-key launch.
+func HideChild(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+}
+
+// Ensure repairs auto-start when it is missing or out of date, and reports
+// whether it changed anything. Self-update only swaps the binary, so without
+// this a machine kept whatever registration its first install made: a legacy
+// `run` Run key with nobody restarting it, or none at all after a cleanup tool
+// removed the task. Called once each time the agent starts.
+func Ensure(execPath string) (bool, error) {
+	if out, err := runBounded("schtasks", "/query", "/tn", taskName, "/xml"); err == nil {
+		if strings.Contains(strings.ToLower(string(utf8OrUTF16(out))), strings.ToLower(xmlEscape(execPath))) {
+			return false, nil
+		}
+		return true, Enable(execPath) // the task points at an old path
+	}
+	out, err := runBounded("reg", "query", legacyKey, "/v", legacyVal)
+	if err == nil && strings.Contains(string(out), runKeyValue(execPath)) {
+		return false, nil
+	}
+	return true, Enable(execPath)
+}
+
+// utf8OrUTF16 decodes schtasks output, which is UTF-16 on some Windows builds.
+func utf8OrUTF16(b []byte) []byte {
+	if len(b) >= 2 && (b[0] == 0xFF && b[1] == 0xFE) {
+		out := make([]byte, 0, len(b)/2)
+		for i := 2; i+1 < len(b); i += 2 {
+			if b[i+1] == 0 {
+				out = append(out, b[i])
+			}
+		}
+		return out
 	}
 	return b
 }

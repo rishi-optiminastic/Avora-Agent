@@ -54,3 +54,18 @@ Name=Avora Agent
 Exec=%s run
 X-GNOME-Autostart-enabled=true
 `
+
+// Ensure re-creates the autostart entry when it is missing.
+func Ensure(execPath string) (bool, error) {
+	path, err := desktopPath()
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	}
+	return true, Enable(execPath)
+}
+
+// HideChild is a no-op on Linux.
+func HideChild(*exec.Cmd) {}

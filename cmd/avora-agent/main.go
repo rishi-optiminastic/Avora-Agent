@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,6 +24,8 @@ import (
 	"avora-agent/internal/enroll"
 	"avora-agent/internal/notify"
 	"avora-agent/internal/runner"
+	"avora-agent/internal/singleton"
+	"avora-agent/internal/supervise"
 )
 
 // hasConsole is false when nothing can see stdout — a Windows double-click from
@@ -74,6 +77,8 @@ func main() {
 		cmdEnroll(cfg)
 	case "run":
 		cmdRun(cfg)
+	case "supervise":
+		cmdSupervise()
 	case "status":
 		cmdStatus(cfg)
 	case "log":
@@ -218,9 +223,68 @@ func adoptToken(cfg *config.Config, token string) {
 	runner.ClearQueue() // queued data belongs to the previous enrollment
 }
 
+// runLockWait lets a process that is replacing an older copy (a self-update
+// restart, a supervisor relaunch) start once that copy has exited.
+const runLockWait = 30 * time.Second
+
 func cmdRun(cfg *config.Config) {
+	release, err := singleton.Acquire("run", runLockWait)
+	if errors.Is(err, singleton.ErrHeld) {
+		fmt.Println("Avora is already running; this copy is exiting.")
+		return
+	}
+	check(err)
+	defer release()
+	repairAutostart()
 	waitForEnrollment(cfg)
 	check(runner.Run(cfg))
+}
+
+// cmdSupervise runs the agent as a child and starts it again whenever it
+// stops. Only machines where Windows refused the scheduled task use it (their
+// Run key launches it); Task Scheduler and launchd supervise everyone else.
+func cmdSupervise() {
+	release, err := singleton.Acquire("supervise", 0)
+	if errors.Is(err, singleton.ErrHeld) {
+		return // one supervisor per user is enough
+	}
+	check(err)
+	defer release()
+	exe, err := os.Executable()
+	check(err)
+	supervise.Loop(supervise.ChildStarter(exe, autostart.HideChild), time.Sleep)
+}
+
+// repairAutostart re-registers auto-start when it has gone missing or points at
+// an old binary. Self-update swaps the binary but never re-registers, so this is
+// how a machine set up by an older installer gets today's supervision. Only the
+// installed copy repairs, so running a downloaded build by hand registers
+// nothing.
+func repairAutostart() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	dir, err := installDir()
+	if err != nil || !sameDir(filepath.Dir(exe), dir) {
+		return
+	}
+	changed, err := autostart.Ensure(exe)
+	switch {
+	case err != nil:
+		fmt.Println("  warn: could not repair auto-start: " + err.Error())
+	case changed:
+		fmt.Println("  auto-start was missing or out of date; repaired")
+	}
+}
+
+func sameDir(a, b string) bool {
+	ra, errA := filepath.EvalSymlinks(a)
+	rb, errB := filepath.EvalSymlinks(b)
+	if errA != nil || errB != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	return strings.EqualFold(filepath.Clean(ra), filepath.Clean(rb))
 }
 
 // enrollPoll is how often `run` re-reads the config while waiting for a token.

@@ -28,10 +28,9 @@ API_URL="${AVORA_API_URL:-https://api.avora.optiminastic.com}"
 # release built without it ships agents that can never update again (v0.7.0
 # went out that way). Set AGENT_REPO=none only for a deliberate local build.
 AGENT_REPO="${AGENT_REPO:-rishi-optiminastic/Avora-Agent}"
-[ "$AGENT_REPO" = "none" ] && AGENT_REPO=""
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || date +%Y.%m.%d.%H%M)}"
 
-[ -z "$AGENT_REPO" ] && echo "WARN: AGENT_REPO unset → self-update disabled in this build." >&2
+[ "$AGENT_REPO" = "none" ] && echo "WARN: AGENT_REPO=none → self-update disabled in this build." >&2
 
 LDFLAGS="-s -w \
   -X avora-agent/internal/config.defaultFEURL=${FE_URL} \

@@ -40,6 +40,25 @@ func Enable(execPath string) error {
 	return launchctl("load", "-w", path)
 }
 
+// Ensure rewrites the LaunchAgent when it is missing or points at another
+// binary, and reports whether it changed anything. launchd's KeepAlive already
+// restarts the agent; this covers a plist deleted by a cleanup tool or left
+// pointing at an old install path.
+func Ensure(execPath string) (bool, error) {
+	path, err := plistPath()
+	if err != nil {
+		return false, err
+	}
+	current, err := os.ReadFile(path)
+	if err == nil && string(current) == fmt.Sprintf(plistTemplate, label, execPath) {
+		return false, nil
+	}
+	return true, Enable(execPath)
+}
+
+// HideChild is a no-op on macOS; the agent never opens a window.
+func HideChild(*exec.Cmd) {}
+
 // Disable unloads and removes the LaunchAgent.
 func Disable() error {
 	path, err := plistPath()

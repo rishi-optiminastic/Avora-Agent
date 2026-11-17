@@ -29,11 +29,26 @@ var (
 	updateRepo = ""
 )
 
+// defaultUpdateRepo is used when a release was built without an update repo.
+// v0.7.0 shipped that way and every machine that took it could never update
+// again; a build has to opt out explicitly (updateRepo=none) to disable it.
+const defaultUpdateRepo = "rishi-optiminastic/Avora-Agent"
+
 // Version is the baked build tag (e.g. "v0.2.0", or "dev" locally).
 func Version() string { return version }
 
-// UpdateRepo is the GitHub repo ("owner/repo") hosting agent releases, or "".
-func UpdateRepo() string { return updateRepo }
+// UpdateRepo is the GitHub repo ("owner/repo") hosting agent releases, or ""
+// when updates are deliberately disabled. Dev builds never update regardless
+// (see version), so the default only ever applies to tagged releases.
+func UpdateRepo() string {
+	switch updateRepo {
+	case "none":
+		return ""
+	case "":
+		return defaultUpdateRepo
+	}
+	return updateRepo
+}
 
 // Config is the on-disk agent state.
 type Config struct {
