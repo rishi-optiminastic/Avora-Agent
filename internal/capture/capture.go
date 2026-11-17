@@ -7,6 +7,12 @@
 // accurate than running OCR over two unrelated layouts at once.
 package capture
 
+import "errors"
+
+// ErrPermissionDenied means the OS refused screen capture (macOS Screen
+// Recording permission). Capture wraps it so callers can use errors.Is.
+var ErrPermissionDenied = errors.New("screen capture permission denied")
+
 // Rect is one monitor's rectangle within the combined capture, in the stored
 // image's pixels (after any downscale).
 type Rect struct {

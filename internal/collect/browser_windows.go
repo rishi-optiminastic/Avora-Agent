@@ -5,7 +5,9 @@ package collect
 import (
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unicode/utf16"
 	"unsafe"
 )
@@ -73,36 +75,89 @@ const (
 	idxGetCurrentPropertyValue = 10 // IUIAutomationElement
 )
 
+// COM interface pointers are held as unsafe.Pointer from the moment COM hands
+// them over, never as uintptr. Converting a uintptr back into a pointer is the
+// pattern `go vet` (rightly) cannot prove safe; keeping them typed as pointers
+// means the only conversions left are pointer -> uintptr at the syscall
+// boundary, which is always valid. They point at COM (non-Go) memory, so the
+// garbage collector ignores them.
+
 // method returns the function pointer for vtable slot `index` of a COM object.
-func method(this uintptr, index int) uintptr {
-	vtbl := *(*uintptr)(unsafe.Pointer(this)) //nolint:govet // COM object (foreign memory)
-	return *(*uintptr)(unsafe.Pointer(vtbl + uintptr(index)*ptrSize))
+func method(this unsafe.Pointer, index int) uintptr {
+	vtbl := *(*unsafe.Pointer)(this)
+	return *(*uintptr)(unsafe.Add(vtbl, uintptr(index)*ptrSize))
 }
 
-func comRelease(this uintptr) {
-	if this != 0 {
-		syscall.SyscallN(method(this, idxRelease), this)
+func comRelease(this unsafe.Pointer) {
+	if this != nil {
+		syscall.SyscallN(method(this, idxRelease), uintptr(this))
 	}
 }
 
 // callOut invokes a vtable method whose LAST parameter is an out **pointer and
-// returns that pointer (0 on failure). The out cell is heap-allocated so its
+// returns that pointer (nil on failure). The out cell is heap-allocated so its
 // address stays valid across the call.
-func callOut(this uintptr, index int, args ...uintptr) uintptr {
-	out := new(uintptr)
-	full := append([]uintptr{this}, args...)
+func callOut(this unsafe.Pointer, index int, args ...uintptr) unsafe.Pointer {
+	out := new(unsafe.Pointer)
+	full := append([]uintptr{uintptr(this)}, args...)
 	full = append(full, uintptr(unsafe.Pointer(out)))
 	r, _, _ := syscall.SyscallN(method(this, index), full...)
 	runtime.KeepAlive(out)
 	if r != 0 {
-		return 0
+		return nil
 	}
 	return *out
 }
 
-// browserURL returns the active tab URL of the foreground browser window, or ""
-// on any failure. Pure in-process COM — no child process, no window.
-func browserURL(hwnd uintptr) (result string) {
+// uiaTimeout bounds one address-bar read. A healthy FindFirst answers in
+// milliseconds; seconds means UI Automation is struggling and we would rather
+// lose the URL than the agent.
+const uiaTimeout = 5 * time.Second
+
+// uiaBusy is a single-flight guard: at most one UIA probe may be outstanding.
+var uiaBusy atomic.Bool
+
+// browserURL reads the foreground browser's address bar, giving up after
+// uiaTimeout.
+//
+// The read itself cannot be cancelled, so it runs on its own goroutine and we
+// walk away from it. That matters because it used to run INLINE on the agent's
+// main loop: FindFirst(TreeScope_Descendants) walks a Chromium window's whole
+// accessibility tree, which is a documented place for UI Automation to block
+// indefinitely, and when it did the entire agent froze — no samples, no
+// screenshots, no pings — while the process sat there looking perfectly
+// healthy. Neither Task Scheduler nor launchd restarts a process that has not
+// exited, so that machine was off the fleet until someone rebooted it. Heavy
+// browser users hit it; light ones never did.
+//
+// The single-flight guard is the other half: without it a wedged probe would be
+// joined by a new one every 30s, each holding its own locked OS thread.
+// Abandoning at most ONE thread is the price of keeping the agent alive. If the
+// probe is still stuck we simply report no URL; activity and screenshots carry
+// on as normal, and the next process start is clean.
+func browserURL(hwnd uintptr) string {
+	if hwnd == 0 {
+		return ""
+	}
+	if !uiaBusy.CompareAndSwap(false, true) {
+		return "" // an earlier probe has not come back; do not pile on
+	}
+	done := make(chan string, 1) // buffered: a late finisher must never block
+	go func() {
+		defer uiaBusy.Store(false)
+		done <- readAddressBar(hwnd)
+	}()
+	select {
+	case url := <-done:
+		return url
+	case <-time.After(uiaTimeout):
+		return ""
+	}
+}
+
+// readAddressBar is the blocking COM read. Only ever called from browserURL's
+// goroutine, which owns the timeout.
+func readAddressBar(hwnd uintptr) (result string) {
 	if hwnd == 0 {
 		return ""
 	}
@@ -116,20 +171,20 @@ func browserURL(hwnd uintptr) (result string) {
 		defer procCoUninitialize.Call()
 	}
 
-	uiaCell := new(uintptr)
+	uiaCell := new(unsafe.Pointer)
 	r, _, _ := procCoCreateInstance.Call(
 		uintptr(unsafe.Pointer(&clsidCUIAutomation)), 0, clsctxInprocServer,
 		uintptr(unsafe.Pointer(&iidIUIAutomation)), uintptr(unsafe.Pointer(uiaCell)),
 	)
 	runtime.KeepAlive(uiaCell)
 	uia := *uiaCell
-	if r != 0 || uia == 0 {
+	if r != 0 || uia == nil {
 		return ""
 	}
 	defer comRelease(uia)
 
 	root := callOut(uia, idxElementFromHandle, hwnd)
-	if root == 0 {
+	if root == nil {
 		return ""
 	}
 	defer comRelease(root)
@@ -140,13 +195,13 @@ func browserURL(hwnd uintptr) (result string) {
 	cond.val = uiaEditControlType
 	condition := callOut(uia, idxCreatePropertyCondition, uiaControlTypeProperty, uintptr(unsafe.Pointer(cond)))
 	runtime.KeepAlive(cond)
-	if condition == 0 {
+	if condition == nil {
 		return ""
 	}
 	defer comRelease(condition)
 
-	edit := callOut(root, idxFindFirst, treeScopeDescendants, condition)
-	if edit == 0 {
+	edit := callOut(root, idxFindFirst, treeScopeDescendants, uintptr(condition))
+	if edit == nil {
 		return ""
 	}
 	defer comRelease(edit)
@@ -154,25 +209,29 @@ func browserURL(hwnd uintptr) (result string) {
 	value := new(comVariant)
 	rv, _, _ := syscall.SyscallN(
 		method(edit, idxGetCurrentPropertyValue),
-		edit, uiaValueValueProperty, uintptr(unsafe.Pointer(value)),
+		uintptr(edit), uiaValueValueProperty, uintptr(unsafe.Pointer(value)),
 	)
 	runtime.KeepAlive(value)
 	if rv != 0 || value.vt != vtBSTR || value.val == 0 {
 		return ""
 	}
-	url := bstrToString(value.val)
-	procSysFreeString.Call(value.val)
+	// For VT_BSTR the union holds a pointer. Read the field's memory AS a
+	// pointer (a *uintptr -> *unsafe.Pointer reinterpretation) rather than
+	// converting the integer value back into one.
+	bstr := *(*unsafe.Pointer)(unsafe.Pointer(&value.val))
+	url := bstrToString(bstr)
+	procSysFreeString.Call(uintptr(bstr))
 	return strings.TrimSpace(url)
 }
 
 // bstrToString reads a null-terminated UTF-16 BSTR (COM memory) into a string.
-func bstrToString(p uintptr) string {
-	if p == 0 {
+func bstrToString(p unsafe.Pointer) string {
+	if p == nil {
 		return ""
 	}
 	buf := make([]uint16, 0, 256)
 	for i := 0; i < 8192; i++ {
-		c := *(*uint16)(unsafe.Pointer(p + uintptr(i)*2)) //nolint:govet // BSTR (foreign memory)
+		c := *(*uint16)(unsafe.Add(p, uintptr(i)*2))
 		if c == 0 {
 			break
 		}

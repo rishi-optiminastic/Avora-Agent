@@ -5,15 +5,18 @@
 //	avora-agent enroll     link this machine to your Avora account (browser)
 //	avora-agent run        start sampling + posting activity
 //	avora-agent status     show enrollment / config
+//	avora-agent log        show recent agent output (start here if it went quiet)
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"avora-agent/internal/autostart"
 	"avora-agent/internal/config"
@@ -48,6 +51,17 @@ func main() {
 		command = os.Args[1]
 	}
 
+	// With no console attached (auto-start, or a Windows double-click) every
+	// print would otherwise go nowhere. Send them to ~/.avora/agent.log instead
+	// so a machine that goes quiet can actually be diagnosed afterwards. Only
+	// `run` may roll the log: it is the one invocation that stays alive to own
+	// the file, and rolling from a short-lived one (the self-update smoke test
+	// runs `status`) would rename the log out from under a live agent, which
+	// then keeps appending to agent.log.1 where nobody looks for it.
+	if !hasConsole {
+		startFileLog(command == "run")
+	}
+
 	cfg, err := config.Load()
 	check(err)
 
@@ -62,6 +76,8 @@ func main() {
 		cmdRun(cfg)
 	case "status":
 		cmdStatus(cfg)
+	case "log":
+		printLog()
 	default:
 		usage()
 		os.Exit(2)
@@ -76,9 +92,7 @@ func cmdInstall(cfg *config.Config) {
 	if !cfg.Enrolled() {
 		token, err := enroll.Run(cfg, hostname(), osName())
 		check(err)
-		cfg.DeviceToken = token
-		cfg.Sequence = 0
-		check(cfg.Save())
+		adoptToken(cfg, token)
 	}
 	// Auto-start is best-effort: if registering it fails, the device is still
 	// enrolled — tell the user how to start it rather than aborting the install.
@@ -183,18 +197,62 @@ func installDir() (string, error) {
 func cmdEnroll(cfg *config.Config) {
 	token, err := enroll.Run(cfg, hostname(), osName())
 	check(err)
-	cfg.DeviceToken = token
-	cfg.Sequence = 0
-	check(cfg.Save())
+	adoptToken(cfg, token)
 	fmt.Println("Device connected. Run `avora-agent run` to start tracking.")
 }
 
+// adoptToken persists a freshly issued device token and clears everything that
+// belonged to the previous enrollment.
+//
+// UnauthorizedSince matters as much as the sequence and the queue: it is how
+// `run` decides the token has been refused long enough to go dormant, so a
+// machine reconnected after a day of rejections would otherwise start straight
+// into dormancy — telling the employee Avora had lost access and capturing
+// nothing for the first dormant interval — on a token the server had just
+// issued.
+func adoptToken(cfg *config.Config, token string) {
+	cfg.DeviceToken = token
+	cfg.Sequence = 0
+	cfg.UnauthorizedSince = ""
+	check(cfg.Save())
+	runner.ClearQueue() // queued data belongs to the previous enrollment
+}
+
 func cmdRun(cfg *config.Config) {
-	if !cfg.Enrolled() {
-		fmt.Println("Not enrolled yet. Run `avora-agent enroll` first.")
-		os.Exit(1)
-	}
+	waitForEnrollment(cfg)
 	check(runner.Run(cfg))
+}
+
+// enrollPoll is how often `run` re-reads the config while waiting for a token.
+const enrollPoll = 60 * time.Second
+
+// waitForEnrollment blocks until a device token exists, telling the user once
+// that the machine needs reconnecting.
+//
+// This used to print a line and exit 1. Nothing could see that line — the
+// release binary is built -H windowsgui and auto-start gives it no console —
+// and auto-start relaunches `run` every few minutes, so an unenrolled machine
+// became an invisible crash-loop: a process that died instantly, forever, while
+// the dashboard just showed the laptop as offline. Waiting instead keeps one
+// quiet process alive (the task's IgnoreNew policy then stops it being
+// restarted) and picks the token up within a minute of the machine being
+// reconnected, with no reboot and no second visit to the laptop.
+func waitForEnrollment(cfg *config.Config) {
+	if cfg.Enrolled() {
+		return
+	}
+	fmt.Println("Not enrolled yet — waiting. Run `avora-agent install` to connect this machine.")
+	notify.Ping("Avora is not connected on this machine. Run the Avora installer to reconnect — " +
+		"it will start working again on its own once you do.")
+	for {
+		time.Sleep(enrollPoll)
+		fresh, err := config.Load()
+		if err == nil && fresh.Enrolled() {
+			*cfg = *fresh
+			fmt.Println("Device token found — starting.")
+			return
+		}
+	}
 }
 
 func cmdStatus(cfg *config.Config) {
@@ -205,6 +263,12 @@ func cmdStatus(cfg *config.Config) {
 	fmt.Printf("Backend:   %s\n", cfg.APIBaseURL)
 	if dir, err := config.Dir(); err == nil {
 		fmt.Printf("Config:    %s/agent.json\n", dir)
+	}
+	fmt.Printf("Log:       %s\n", logPath())
+	if cfg.UnauthorizedSince != "" {
+		fmt.Printf("Token:     REFUSED by the server since %s (still retrying)\n", cfg.UnauthorizedSince)
+	} else {
+		fmt.Println("Token:     accepted")
 	}
 }
 
@@ -219,7 +283,9 @@ func hostname() string {
 // osName returns a friendly OS label, e.g. "macOS 14.5".
 func osName() string {
 	if runtime.GOOS == "darwin" {
-		if out, err := exec.Command("sw_vers", "-productVersion").Output(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, "sw_vers", "-productVersion").Output(); err == nil {
 			return "macOS " + strings.TrimSpace(string(out))
 		}
 		return "macOS"
@@ -235,6 +301,7 @@ func usage() {
 	fmt.Println("  avora-agent enroll     link this machine to your Avora account")
 	fmt.Println("  avora-agent run        start sampling + posting activity")
 	fmt.Println("  avora-agent status     show enrollment / config")
+	fmt.Println("  avora-agent log        show recent agent output")
 }
 
 // say reports success to whoever is watching: the terminal when there is one,

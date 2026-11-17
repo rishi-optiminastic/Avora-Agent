@@ -35,6 +35,26 @@ GOOS=windows GOARCH=amd64 go build -o bin/avora-agent.exe ./cmd/avora-agent
 GOOS=linux   GOARCH=amd64 go build -o bin/avora-agent-linux ./cmd/avora-agent
 ```
 
+## Release (self-update)
+
+Installed agents poll `releases/latest/download/VERSION` on `AGENT_REPO` and only swap in a new binary whose SHA-256 matches `SHA256SUMS` from the same release.
+A release without `SHA256SUMS` (or with a stale one) is refused by every agent.
+
+1. Pick a new version tag (e.g. `v0.8.0`); it must differ from the running one.
+2. `VERSION=v0.8.0 AGENT_REPO=<owner>/<repo> ./build-agent.sh`
+3. Create the release and upload ALL of `dist/`: `avora-agent.exe`, `avora-agent-macos-arm64`, `avora-agent-macos-intel`, `VERSION`, `SHA256SUMS`.
+4. Mark it as the latest release.
+
+Never edit a binary after `build-agent.sh` (that changes its hash); rebuild instead.
+
+## Offline queue and health
+
+- Samples and screenshots that cannot be delivered are kept in `~/.avora/queue/` (max 3000 items, 200 MB; oldest dropped first) and sent oldest-first with backoff (15 s doubling to 10 min).
+- Screenshots wait up to 12 h; activity samples only 15 min, so a longer outage stays a gap rather than replaying as a burst of stale activity at reconnect.
+- Sequence numbers are drawn at send time and pinned for retries, so they stay strictly increasing in the order the server receives them.
+- Permanent rejections (4xx other than 401/403/408/409/429) are logged and dropped.
+- Every ~5 min, and on any status change, the agent posts `POST /api/v1/devices/health` (screen capture / window info / browser URL status, last error, queue size). Not queued; a 404 from an older backend is logged once.
+
 ## Use
 
 ```bash

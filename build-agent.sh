@@ -17,7 +17,8 @@
 # AUTO-UPDATE: set AGENT_REPO=<owner>/<repo> so the agent self-updates from that
 # repo's latest release (it polls releases/latest/download/VERSION). VERSION is
 # the build tag baked in + written to dist/VERSION — ALWAYS upload dist/* (incl.
-# VERSION) to the release so installed agents detect + pull the new build.
+# VERSION and SHA256SUMS) to the release so installed agents detect, verify and
+# pull the new build. Without SHA256SUMS every agent refuses the update.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -65,10 +66,22 @@ if command -v codesign >/dev/null 2>&1; then
   sign "$OUT/avora-agent-macos-intel"
 fi
 
+# Checksums LAST (codesign rewrites the macOS binaries). The agent's
+# self-update downloads SHA256SUMS from the same release and refuses any asset
+# whose hash does not match, so it MUST be uploaded with the binaries.
+(
+  cd "$OUT"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum avora-agent* > SHA256SUMS
+  else
+    shasum -a 256 avora-agent* > SHA256SUMS
+  fi
+)
+
 echo "Done → $OUT ($VERSION)"
 ls -lh "$OUT"
 echo
-echo "Next: publish a release with ALL of dist/* (incl. VERSION) so installed agents auto-update:"
+echo "Next: publish a release with ALL of dist/* (incl. VERSION and SHA256SUMS) so installed agents auto-update:"
 echo "  gh release create ${VERSION} ./dist/* --repo ${AGENT_REPO:-<owner>/<repo>} --title ${VERSION} --notes 'Agent build'"
 echo "  # or update the existing 'latest' release:"
 echo "  gh release upload ${VERSION} ./dist/* --repo ${AGENT_REPO:-<owner>/<repo>} --clobber"

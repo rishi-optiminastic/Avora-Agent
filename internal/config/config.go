@@ -46,6 +46,14 @@ type Config struct {
 	// server also drops anything captured while the employee is in personal
 	// mode, so this is an optimization, not the privacy boundary.
 	PersonalMode bool `json:"personal_mode"`
+	// UnauthorizedSince is when the server started rejecting this device's
+	// token, in an unbroken run of rejections (RFC3339); empty when the last
+	// call that reached the server was accepted.
+	//
+	// Persisted, not just held in memory, because the whole point is to measure
+	// a LONG window: a restart in the middle of an outage must not reset the
+	// clock and must not forget that we are currently locked out.
+	UnauthorizedSince string `json:"unauthorized_since,omitempty"`
 }
 
 // Dir is ~/.avora.

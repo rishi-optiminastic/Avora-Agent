@@ -4,10 +4,12 @@
 package autostart
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 const label = "com.avora.agent"
@@ -34,8 +36,8 @@ func Enable(execPath string) error {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return err
 	}
-	_ = exec.Command("launchctl", "unload", path).Run() // ignore "not loaded"
-	return exec.Command("launchctl", "load", "-w", path).Run()
+	_ = launchctl("unload", path) // ignore "not loaded"
+	return launchctl("load", "-w", path)
 }
 
 // Disable unloads and removes the LaunchAgent.
@@ -44,11 +46,24 @@ func Disable() error {
 	if err != nil {
 		return err
 	}
-	_ = exec.Command("launchctl", "unload", path).Run()
+	_ = launchctl("unload", path)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
+}
+
+// launchctlTimeout bounds a launchctl call. It normally answers instantly, but
+// it talks to launchd over IPC and can block when launchd is busy — and with no
+// bound that hung the installer with nothing on screen to explain it.
+const launchctlTimeout = 30 * time.Second
+
+func launchctl(args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), launchctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "launchctl", args...)
+	cmd.WaitDelay = time.Second
+	return cmd.Run()
 }
 
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>

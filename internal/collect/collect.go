@@ -14,4 +14,11 @@ type Sample struct {
 	// name (both "" for non-browsers or when Automation permission is denied).
 	PageTitle string
 	Browser   string
+
+	// WindowDenied / BrowserDenied report that the OS refused the permission
+	// needed to read the foreground app or the browser tab (macOS Accessibility
+	// / Automation). Diagnostics for the health report only: never sent with
+	// the sample and never queued.
+	WindowDenied  bool `json:"-"`
+	BrowserDenied bool `json:"-"`
 }

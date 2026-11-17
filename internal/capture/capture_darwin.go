@@ -4,11 +4,15 @@ package capture
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"os"
 	"os/exec"
+	"strings"
+	"time"
 )
 
 const (
@@ -20,6 +24,15 @@ const (
 	// Capture up to this many displays. `screencapture` writes one file per
 	// display in order; extra paths for absent displays are left empty.
 	maxDisplays = 4
+	// captureTimeout bounds the screencapture child. Four displays take a couple
+	// of seconds; anything near this means it is stuck.
+	//
+	// It had no bound at all, on the agent's main loop. screencapture can block
+	// indefinitely when Screen Recording permission has not been granted, when
+	// the display is asleep or locked, or behind a secure-input window — and a
+	// blocked capture froze the whole agent, which neither launchd nor Task
+	// Scheduler can detect because the process never exits.
+	captureTimeout = 20 * time.Second
 )
 
 // Capture grabs EVERY display via `screencapture` (one file per screen),
@@ -42,7 +55,16 @@ func Capture() (Shot, error) {
 
 	// -x: silent (no shutter sound), -t jpg: JPEG, one file per display.
 	args := append([]string{"-x", "-t", "jpg"}, paths...)
-	if err := exec.Command("screencapture", args...).Run(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), captureTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "screencapture", args...)
+	cmd.WaitDelay = time.Second
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Without Screen Recording permission screencapture fails with "could
+		// not create image from display".
+		if strings.Contains(strings.ToLower(string(out)), "could not create image") {
+			return Shot{}, fmt.Errorf("%w: %v", ErrPermissionDenied, err)
+		}
 		return Shot{}, err
 	}
 

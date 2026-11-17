@@ -80,10 +80,14 @@ func metric(i int) int {
 // one per capture (every few minutes) would eventually exhaust the limit. The
 // agent captures serially, so a package-level slice guarded by a mutex is safe.
 var (
-	enumMu       sync.Mutex
-	enumCollect  []winRect
-	enumCallback = syscall.NewCallback(func(_, _, lprc, _ uintptr) uintptr {
-		enumCollect = append(enumCollect, *(*winRect)(unsafe.Pointer(lprc)))
+	enumMu      sync.Mutex
+	enumCollect []winRect
+	// lprc is declared as a typed pointer (pointer-sized, so NewCallback accepts
+	// it) instead of a uintptr that would need converting back into a pointer.
+	enumCallback = syscall.NewCallback(func(_, _ uintptr, lprc *winRect, _ uintptr) uintptr {
+		if lprc != nil {
+			enumCollect = append(enumCollect, *lprc)
+		}
 		return 1 // continue enumeration
 	})
 )

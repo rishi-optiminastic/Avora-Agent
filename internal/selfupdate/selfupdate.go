@@ -7,10 +7,14 @@
 package selfupdate
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -56,11 +60,27 @@ func CheckAndApply(current, repo string) {
 	}
 
 	newPath := exe + ".new"
-	if err := download(base+"/"+asset, newPath); err != nil {
+	// Integrity first: the asset must match the SHA256SUMS published in the
+	// same release, or it is never even executed.
+	if err := downloadVerified(base, asset, newPath); err != nil {
+		fmt.Println("  warn: self-update refused, keeping current version: " + err.Error())
 		_ = os.Remove(newPath)
 		return
 	}
 	_ = os.Chmod(newPath, 0o755)
+	// Prove the download actually runs on THIS machine before it replaces the
+	// agent. apply() renames the new file over the live one, so a binary that
+	// cannot start (truncated upload, wrong architecture, a release asset built
+	// wrong, an antivirus that mangles it on write) used to be installed anyway
+	// — and from then on auto-start relaunched a broken exe every few minutes,
+	// forever, with no rollback. That is a permanently dead machine, shipped by
+	// an update. A binary that cannot even print its own status is not one we
+	// are willing to swap in.
+	if err := verify(newPath); err != nil {
+		fmt.Println("  warn: downloaded agent failed its smoke test, keeping current version: " + err.Error())
+		_ = os.Remove(newPath)
+		return
+	}
 	if err := apply(exe, newPath); err != nil {
 		_ = os.Remove(newPath)
 		return
@@ -73,6 +93,15 @@ func CheckAndApply(current, repo string) {
 	if err := restart(exe); err != nil {
 		fmt.Println("  warn: self-update relaunch failed, staying on current version: " + err.Error())
 	}
+}
+
+// verify runs the freshly downloaded binary once and requires a clean exit.
+// `status` only reads the config and prints, so it is side-effect free and
+// exercises the one thing we need to know: that this file starts and runs here.
+func verify(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, path, "status").Run()
 }
 
 func fetchText(url string) (string, error) {
@@ -88,21 +117,79 @@ func fetchText(url string) (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-func download(url, dest string) error {
-	body, err := get(url, 5*time.Minute)
+// checksumsFile is the release asset listing "<sha256-hex>  <asset>" per line,
+// written by build-agent.sh.
+const (
+	checksumsFile     = "SHA256SUMS"
+	maxChecksumsBytes = 64 << 10
+)
+
+// downloadVerified fetches SHA256SUMS and the asset from base and writes the
+// asset to dest only if its SHA-256 matches. A missing checksum file, a
+// missing line for the asset, or a mismatch are all refusals.
+func downloadVerified(base, asset, dest string) error {
+	sums, err := fetchLimited(base+"/"+checksumsFile, maxChecksumsBytes)
+	if err != nil {
+		return fmt.Errorf("checksum file unavailable: %w", err)
+	}
+	want, err := expectedSum(sums, asset)
 	if err != nil {
 		return err
+	}
+	got, err := download(base+"/"+asset, dest)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("checksum mismatch for %s: got %s, want %s", asset, got, want)
+	}
+	return nil
+}
+
+// expectedSum finds asset's hash in a sha256sum-format file.
+func expectedSum(sums []byte, asset string) (string, error) {
+	for _, line := range strings.Split(string(sums), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "*") // binary-mode marker
+		if name == asset && len(fields[0]) == sha256.Size*2 {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("no checksum for %s in %s", asset, checksumsFile)
+}
+
+// download writes url to dest and returns the hex SHA-256 of what it wrote.
+func download(url, dest string) (string, error) {
+	body, err := get(url, 5*time.Minute)
+	if err != nil {
+		return "", err
 	}
 	defer func() { _ = body.Close() }()
 	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := io.Copy(f, body); err != nil {
-		return err
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, h), body); err != nil {
+		return "", err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func fetchLimited(url string, limit int64) ([]byte, error) {
+	body, err := get(url, 20*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	return io.ReadAll(io.LimitReader(body, limit))
 }
 
 // get does a GET that follows redirects (GitHub release downloads redirect to a

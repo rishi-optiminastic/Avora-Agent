@@ -4,7 +4,45 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"avora-agent/internal/config"
 )
+
+// A machine reconnected after a long run of refused calls must come back as a
+// clean enrollment. Leaving UnauthorizedSince behind sent `run` straight into
+// dormancy — warning the employee that Avora had lost access, and capturing
+// nothing for the first dormant interval — on a token the server had just
+// issued.
+func TestAdoptTokenClearsThePreviousEnrollment(t *testing.T) {
+	withHome(t)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DeviceToken = "old-token"
+	cfg.Sequence = 4210
+	cfg.UnauthorizedSince = "2026-01-01T00:00:00Z"
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	adoptToken(cfg, "fresh-token")
+
+	reloaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.DeviceToken != "fresh-token" {
+		t.Fatalf("token = %q; want the new one persisted", reloaded.DeviceToken)
+	}
+	if reloaded.Sequence != 0 {
+		t.Fatalf("sequence = %d; want 0 for a new enrollment", reloaded.Sequence)
+	}
+	if reloaded.UnauthorizedSince != "" {
+		t.Fatalf("UnauthorizedSince = %q; a new token must not start out refused",
+			reloaded.UnauthorizedSince)
+	}
+}
 
 // A double-click on an already-installed agent re-runs install, so the swap has
 // to cope with a target that already exists — on Windows, one that is locked by

@@ -3,12 +3,14 @@
 package autostart
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf16"
 )
 
@@ -25,10 +27,40 @@ const (
 // a second copy when one is already running. This is the Windows equivalent of
 // launchd's KeepAlive on macOS. No admin rights are needed (it runs as the
 // logged-in user).
+// cmdTimeout bounds each external call the installer makes. schtasks and the
+// ScheduledTasks cmdlets answer in seconds; a minute means something is wedged.
+// Without a bound, a hung powershell left the double-click installer doing
+// nothing visible, forever, with no window to close and nothing in a log.
+const cmdTimeout = 60 * time.Second
+
+// command builds an external command that cannot outlive cmdTimeout. The
+// returned cancel must be called by the caller (defer) once the command is done.
+func command(name string, args ...string) (*exec.Cmd, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 2 * time.Second
+	return cmd, cancel
+}
+
+// runBounded runs a command to completion under cmdTimeout, returning its
+// combined output.
+func runBounded(name string, args ...string) ([]byte, error) {
+	cmd, cancel := command(name, args...)
+	defer cancel()
+	return cmd.CombinedOutput()
+}
+
+// quietBounded runs a command under cmdTimeout, discarding the result.
+func quietBounded(name string, args ...string) error {
+	cmd, cancel := command(name, args...)
+	defer cancel()
+	return cmd.Run()
+}
+
 func Enable(execPath string) error {
 	// Clear any stale legacy Run-key entry up front; we re-add it below only as
 	// the last-resort fallback, so a scheduled task and the key never both fire.
-	_ = exec.Command("reg", "delete", legacyKey, "/v", legacyVal, "/f").Run()
+	_ = quietBounded("reg", "delete", legacyKey, "/v", legacyVal, "/f")
 
 	// 1) Preferred: a per-user, self-healing scheduled task. We try the modern
 	// ScheduledTasks PowerShell cmdlets FIRST — they reliably accept the full
@@ -45,10 +77,10 @@ func Enable(execPath string) error {
 		// now (install runs mid-session; a LogonTrigger only fires on a *future*
 		// logon). Via schtasks so Task Scheduler tracks the instance (IgnoreNew
 		// stops a duplicate) and it survives the installer's terminal closing.
-		if err := exec.Command("schtasks", "/query", "/tn", taskName).Run(); err != nil {
+		if err := quietBounded("schtasks", "/query", "/tn", taskName); err != nil {
 			return fmt.Errorf("auto-start task %q not found after create: %w", taskName, err)
 		}
-		_ = exec.Command("schtasks", "/run", "/tn", taskName).Run()
+		_ = quietBounded("schtasks", "/run", "/tn", taskName)
 		return nil
 	}
 
@@ -74,9 +106,9 @@ func Enable(execPath string) error {
 // The exe is built -H windowsgui, so a Run-key launch shows no console window.
 func createViaRunKey(execPath string) error {
 	value := fmt.Sprintf(`"%s" run`, execPath)
-	out, err := exec.Command(
+	out, err := runBounded(
 		"reg", "add", legacyKey, "/v", legacyVal, "/t", "REG_SZ", "/d", value, "/f",
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -108,9 +140,9 @@ func createViaXML(execPath string) error {
 	}
 	defer func() { _ = os.Remove(xmlPath) }()
 	// /f overwrites an existing definition, so re-running install upgrades it.
-	out, err := exec.Command(
+	out, err := runBounded(
 		"schtasks", "/create", "/tn", taskName, "/xml", xmlPath, "/f",
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -130,14 +162,19 @@ func createViaPowerShell(execPath string) error {
 		"$logon=New-ScheduledTaskTrigger -AtLogOn;" +
 		"$heal=New-ScheduledTaskTrigger -Once -At (Get-Date) " +
 		"-RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 3650);" +
+		// -StartWhenAvailable matters after sleep/hibernate or a machine that was
+		// off: without it Task Scheduler SKIPS a missed occurrence outright
+		// rather than running it late. The XML path has always set it; this is
+		// the path that actually runs on most machines, so it needs it too.
 		"$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries " +
+		"-StartWhenAvailable " +
 		"-ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) " +
 		"-RestartCount 3 -MultipleInstances IgnoreNew;" +
 		"Register-ScheduledTask -TaskName '" + taskName + "' -Action $a -Trigger $logon,$heal " +
 		"-Settings $s -Force | Out-Null"
-	out, err := exec.Command(
+	out, err := runBounded(
 		"powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -151,8 +188,8 @@ func psEscape(s string) string {
 
 // Disable removes the Scheduled Task (and any legacy Run-key entry).
 func Disable() error {
-	_ = exec.Command("reg", "delete", legacyKey, "/v", legacyVal, "/f").Run()
-	return exec.Command("schtasks", "/delete", "/tn", taskName, "/f").Run()
+	_ = quietBounded("reg", "delete", legacyKey, "/v", legacyVal, "/f")
+	return quietBounded("schtasks", "/delete", "/tn", taskName, "/f")
 }
 
 // taskXML builds the Task Scheduler definition. Key settings:
