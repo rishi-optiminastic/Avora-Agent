@@ -33,11 +33,23 @@ const (
 	queueMaxAge   = 12 * time.Hour
 	// activityMaxAge bridges a short outage only; see above.
 	activityMaxAge = 15 * time.Minute
+
+	// outgoingBuffer holds captures waiting for the courier. At one capture
+	// every ~15s that is over an hour of slack, far beyond any single slow call.
+	outgoingBuffer = 256
+	// courierTick is how often the courier drains the backlog and reports health
+	// when nothing new has arrived.
+	courierTick = 5 * time.Second
+	// screenshotTimeout is generous because uploads no longer block capture: a
+	// slow office link can take its time instead of failing at 20s.
+	screenshotTimeout = 60 * time.Second
 )
 
 // agent is the state the main loop carries between ticks.
 type agent struct {
 	client        *http.Client
+	pingClient    *http.Client
+	outgoing      chan *queue.Entry
 	cfg           *config.Config
 	outbox        *outbox.Outbox
 	health        *health.Tracker
@@ -48,9 +60,10 @@ type agent struct {
 
 func newAgent(client *http.Client, cfg *config.Config) *agent {
 	a := &agent{
-		client: client,
-		cfg:    cfg,
-		health: health.NewTracker(runtime.GOOS),
+		client:     client,
+		pingClient: client,
+		cfg:        cfg,
+		health:     health.NewTracker(runtime.GOOS),
 	}
 	q, err := OpenQueue()
 	if err != nil {
@@ -59,7 +72,8 @@ func newAgent(client *http.Client, cfg *config.Config) *agent {
 		fmt.Println("  warn: offline queue unavailable, failed sends will be dropped: " + err.Error())
 		q = nil
 	}
-	a.outbox = outbox.New(q, transport{client, cfg}, sequencer{cfg}, logLine)
+	shotClient := &http.Client{Timeout: screenshotTimeout}
+	a.outbox = outbox.New(q, transport{client, shotClient, cfg}, sequencer{cfg}, logLine)
 	a.reporter = health.NewReporter(func(r health.Report) error {
 		return ingest.SendHealth(client, cfg, r)
 	}, logLine)
@@ -96,6 +110,55 @@ func logLine(format string, args ...any) {
 	fmt.Printf(format+"\n", args...)
 }
 
+// startCourier launches the goroutine that owns every upload. The capture loop
+// only ever hands entries over (submit), so capture keeps its rhythm however
+// slow the network is; the outbox and its sequence counter are touched by this
+// one goroutine only, which keeps delivery strictly in order.
+func (a *agent) startCourier() {
+	a.outgoing = make(chan *queue.Entry, outgoingBuffer)
+	go a.courier()
+}
+
+// submit hands a capture to the courier without ever blocking. If the courier
+// has fallen a whole buffer behind, the capture is dropped and said so, rather
+// than freezing capture behind it.
+func (a *agent) submit(e *queue.Entry) {
+	if a.outgoing == nil { // courier not started (tests): deliver inline
+		a.noteDelivery(e.Kind, a.outbox.Submit(e))
+		return
+	}
+	select {
+	case a.outgoing <- e:
+	default:
+		fmt.Printf("  warn: delivery is %d captures behind; dropping a %s\n", outgoingBuffer, e.Kind)
+	}
+}
+
+// courier runs forever. Each step is recovered on its own, so a panic in one
+// send costs that send, never the goroutine.
+func (a *agent) courier() {
+	ticker := time.NewTicker(courierTick)
+	defer ticker.Stop()
+	for {
+		a.courierStep(ticker.C)
+	}
+}
+
+func (a *agent) courierStep(tick <-chan time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("  warn: delivery recovered from panic, continuing: %v\n", r)
+		}
+	}()
+	select {
+	case e := <-a.outgoing:
+		a.noteDelivery(e.Kind, a.outbox.Submit(e))
+	case <-tick:
+		a.deliverBacklog()
+		a.reportHealth()
+	}
+}
+
 // deliverBacklog drains the offline queue a bounded amount per tick.
 func (a *agent) deliverBacklog() {
 	res := a.outbox.Drain(outbox.DrainBudget)
@@ -103,6 +166,9 @@ func (a *agent) deliverBacklog() {
 		recordAuth(a.cfg, res.Err)
 	} else if res.Delivered {
 		recordAuth(a.cfg, nil)
+		// The server is reachable again: earlier send failures are over.
+		a.health.NoteSuccess("activity send")
+		a.health.NoteSuccess("screenshot send")
 	}
 }
 
@@ -119,6 +185,10 @@ func (a *agent) noteDelivery(kind string, res outbox.Result) {
 		fmt.Printf("  warn (%s): %s%s\n", kind, res.Err.Error(), suffix)
 	case res.Delivered:
 		recordAuth(a.cfg, nil)
+		a.health.NoteSuccess(kind + " send")
+		if !res.Queued {
+			fmt.Printf("  ✓ %s delivered (seq %d)\n", kind, res.Sequence)
+		}
 	}
 }
 
@@ -140,8 +210,9 @@ func (a *agent) reportHealth() {
 
 // transport adapts the ingest calls to the outbox.
 type transport struct {
-	client *http.Client
-	cfg    *config.Config
+	client     *http.Client
+	shotClient *http.Client
+	cfg        *config.Config
 }
 
 func (t transport) SendActivity(seq int, e *queue.Entry) error {
@@ -155,7 +226,7 @@ func (t transport) SendScreenshot(e *queue.Entry) error {
 	if e.Shot == nil {
 		return &ingest.StatusError{Op: "screenshot upload", Code: http.StatusBadRequest, Body: "queued shot is empty"}
 	}
-	return ingest.SendScreenshot(t.client, t.cfg, *e.Shot, e.CapturedAt)
+	return ingest.SendScreenshot(t.shotClient, t.cfg, *e.Shot, e.CapturedAt)
 }
 
 // sequencer persists the per-device counter in agent.json BEFORE the number
@@ -165,6 +236,8 @@ type sequencer struct{ cfg *config.Config }
 func (s sequencer) Next() int { return s.Advance(1) }
 
 func (s sequencer) Advance(n int) int {
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	s.cfg.Sequence += n
 	if err := s.cfg.Save(); err != nil {
 		fmt.Println("  warn (sequence save): " + err.Error())

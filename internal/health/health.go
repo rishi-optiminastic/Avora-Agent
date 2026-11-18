@@ -12,6 +12,7 @@ package health
 import (
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"avora-agent/internal/capture"
@@ -52,13 +53,24 @@ type Statuses struct {
 
 // Tracker accumulates capture outcomes. Not safe for concurrent use.
 type Tracker struct {
+	// mu guards everything below: the capture loop observes samples and
+	// screenshots while the delivery goroutine records sends and builds reports.
+	mu             sync.Mutex
 	statuses       Statuses
 	captureFails   int
 	windowEmpty    int
 	browserEmpty   int
 	lastError      string
+	lastErrorFrom  string // which source recorded it ("screenshot", "activity send"...)
+	lastErrorAt    time.Time
 	browserSupport bool
+	now            func() time.Time
 }
+
+// errorFreshFor is how long an error keeps being reported. Without it a single
+// DNS blip an hour ago sat under a perfectly healthy machine forever, reading
+// as a fault that was long over.
+const errorFreshFor = 15 * time.Minute
 
 // NewTracker starts every status at "unknown"; browser_url is "unsupported" on
 // platforms without a browser reader (anything but macOS and Windows).
@@ -66,6 +78,7 @@ func NewTracker(goos string) *Tracker {
 	t := &Tracker{
 		statuses:       Statuses{StatusUnknown, StatusUnknown, StatusUnknown},
 		browserSupport: goos == "darwin" || goos == "windows",
+		now:            time.Now,
 	}
 	if !t.browserSupport {
 		t.statuses.BrowserURL = StatusUnsupported
@@ -74,20 +87,31 @@ func NewTracker(goos string) *Tracker {
 }
 
 // Statuses returns the current statuses.
-func (t *Tracker) Statuses() Statuses { return t.statuses }
+func (t *Tracker) Statuses() Statuses {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.statuses
+}
 
 // LastError is the most recent recorded error, already sanitised.
-func (t *Tracker) LastError() string { return t.lastError }
+func (t *Tracker) LastError() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastError
+}
 
 // ObserveCapture records one screenshot attempt.
 func (t *Tracker) ObserveCapture(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if err == nil {
 		t.captureFails = 0
 		t.statuses.ScreenCapture = StatusOK
+		t.clearError("screenshot")
 		return
 	}
 	t.captureFails++
-	t.RecordError("screenshot", err)
+	t.recordError("screenshot", err)
 	switch {
 	case errors.Is(err, capture.ErrPermissionDenied):
 		t.statuses.ScreenCapture = StatusPermissionDenied
@@ -98,10 +122,13 @@ func (t *Tracker) ObserveCapture(err error) {
 
 // ObserveSample records one activity collection.
 func (t *Tracker) ObserveSample(s collect.Sample, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if err != nil {
-		t.RecordError("collect", err)
+		t.recordError("collect", err)
 		return // the platform cannot collect at all: leave statuses as they are
 	}
+	t.clearError("collect")
 	t.observeWindow(s)
 	if t.browserSupport {
 		t.observeBrowser(s)
@@ -149,10 +176,32 @@ func (t *Tracker) observeBrowser(s collect.Sample) {
 // Callers must pass errors that carry no window titles, URLs or server replies
 // (use ingest.Short for HTTP errors).
 func (t *Tracker) RecordError(source string, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.recordError(source, err)
+}
+
+// NoteSuccess clears the last error if it came from the same source: a send
+// that works again means the earlier send failure is over.
+func (t *Tracker) NoteSuccess(source string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.clearError(source)
+}
+
+func (t *Tracker) recordError(source string, err error) {
 	if err == nil {
 		return
 	}
 	t.lastError = Sanitize(source + ": " + err.Error())
+	t.lastErrorFrom = source
+	t.lastErrorAt = t.now()
+}
+
+func (t *Tracker) clearError(source string) {
+	if t.lastErrorFrom == source {
+		t.lastError, t.lastErrorFrom = "", ""
+	}
 }
 
 // Sanitize trims an error message to its first line and the contract's length.
@@ -188,6 +237,8 @@ type QueueInfo struct {
 
 // Build assembles a report from the tracker's state and the queue's.
 func (t *Tracker) Build(version, goos string, q QueueInfo) Report {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	r := Report{
 		AgentVersion:  version,
 		OS:            goos,
@@ -197,7 +248,7 @@ func (t *Tracker) Build(version, goos string, q QueueInfo) Report {
 		QueueItems:    q.Items,
 		QueueBytes:    q.Bytes,
 	}
-	if t.lastError != "" {
+	if t.lastError != "" && t.now().Sub(t.lastErrorAt) <= errorFreshFor {
 		msg := t.lastError
 		r.LastError = &msg
 	}

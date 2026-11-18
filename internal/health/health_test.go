@@ -146,3 +146,33 @@ func TestReportQueueAge(t *testing.T) {
 		t.Fatal("oldest age in seconds")
 	}
 }
+
+func TestAnErrorClearsWhenTheSameSourceRecovers(t *testing.T) {
+	tr := NewTracker("windows")
+	tr.RecordError("activity send", errors.New("dial tcp: lookup api: no such host"))
+	if tr.LastError() == "" {
+		t.Fatal("the error should be recorded")
+	}
+	tr.NoteSuccess("screenshot send")
+	if tr.LastError() == "" {
+		t.Fatal("a success elsewhere must not hide a different failure")
+	}
+	tr.NoteSuccess("activity send")
+	if got := tr.LastError(); got != "" {
+		t.Fatalf("a recovered send must clear its error, got %q", got)
+	}
+}
+
+func TestAnOldErrorStopsBeingReported(t *testing.T) {
+	tr := NewTracker("windows")
+	clock := time.Now()
+	tr.now = func() time.Time { return clock }
+	tr.RecordError("screenshot send", errors.New("context deadline exceeded"))
+	if tr.Build("v1", "windows", QueueInfo{}).LastError == nil {
+		t.Fatal("a fresh error is reported")
+	}
+	clock = clock.Add(errorFreshFor + time.Minute)
+	if tr.Build("v1", "windows", QueueInfo{}).LastError != nil {
+		t.Fatal("an error older than the freshness window must not be reported")
+	}
+}

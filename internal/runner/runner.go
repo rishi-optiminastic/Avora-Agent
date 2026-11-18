@@ -1,8 +1,9 @@
 // Package runner is the agent's main loop. A short base tick drives the
 // cadences: poll for pings every tick (responsive), sample activity every ~30s,
-// capture a screenshot every few minutes, drain the offline queue, and report
-// capture health. Delivery (sequence numbers, offline queue, backoff) is owned
-// by the outbox package; see delivery.go for the wiring.
+// capture a screenshot every few minutes. Everything that talks to the network
+// slowly - uploads, the offline backlog, health reports, self-update - runs on
+// its own goroutine, so a slow server or a dead wifi never stops capture. See
+// delivery.go for the wiring.
 package runner
 
 import (
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +29,7 @@ const (
 	activityEverySteps   = 2   // ~30s
 	screenshotEverySteps = 20  // ~5min
 	updateEverySteps     = 960 // ~4h — check for a newer release + self-update
+	pingTimeout          = 8 * time.Second
 	// Debounce event-triggered screenshots so rapid app-switching can't spam.
 	eventShotMinInterval = 90 * time.Second
 
@@ -59,6 +62,9 @@ const (
 // itself.
 func Run(cfg *config.Config) error {
 	client := &http.Client{Timeout: 20 * time.Second}
+	// Commands are polled from the capture loop, so that call stays short:
+	// a slow server costs at most a few seconds of a tick, never a sample.
+	pingClient := &http.Client{Timeout: pingTimeout}
 	// Clear any stale personal-mode pause persisted by an older build, so a
 	// previously-paused machine resumes (the toggle was removed; capture is
 	// always on) and never sits looking offline.
@@ -68,6 +74,8 @@ func Run(cfg *config.Config) error {
 	}
 	fmt.Println("Avora agent running — Ctrl-C to stop.")
 	a := newAgent(client, cfg)
+	a.pingClient = pingClient
+	a.startCourier()
 	warnedDormant := false
 
 	// The supervisors can only replace a process that EXITED; nothing on either
@@ -138,6 +146,11 @@ func dormantTick(client *http.Client, cfg *config.Config, warned bool) bool {
 
 // ---- token-rejection state ------------------------------------------------ #
 
+// stateMu guards the agent's saved state (agent.json): the capture loop and the
+// delivery goroutine both update it - token status from any call, the sequence
+// counter from sends - and two concurrent Saves would interleave the file.
+var stateMu sync.Mutex
+
 // recordAuth folds one call's outcome into the current run of rejections.
 //
 // Only a reply that actually reached the backend says anything about the token:
@@ -145,6 +158,8 @@ func dormantTick(client *http.Client, cfg *config.Config, warned bool) bool {
 // neither starts nor clears a run. A replay (409) is proof the token was
 // ACCEPTED — authentication runs before the route — so it clears one.
 func recordAuth(cfg *config.Config, err error) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	switch {
 	case errors.Is(err, ingest.ErrUnauthorized):
 		noteAuthFailure(cfg)
@@ -174,6 +189,8 @@ func noteAuthOK(cfg *config.Config) {
 // rejectedFor is how long the current unbroken run of 401s has lasted, or 0
 // when the last call that reached the server was accepted.
 func rejectedFor(cfg *config.Config) time.Duration {
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	if cfg.UnauthorizedSince == "" {
 		return 0
 	}
@@ -204,7 +221,7 @@ func (a *agent) runStep(step int) {
 	// is published, this swaps the binary and restarts — so a fix ships to
 	// every machine on its own, no reinstall. Best-effort; never blocks work.
 	if step%updateEverySteps == 0 {
-		selfupdate.CheckAndApply(config.Version(), config.UpdateRepo())
+		checkForUpdate()
 	}
 	// Poll inbound commands (capture/ping/update) first.
 	recordAuth(a.cfg, a.handlePings())
@@ -226,15 +243,14 @@ func (a *agent) runStep(step int) {
 		a.shotTick()
 		a.lastEventShot = time.Now()
 	}
-	// Send whatever is waiting from earlier failures (no-op while backing off).
-	a.deliverBacklog()
-	a.reportHealth()
+	// Uploads, the offline backlog and health reports are the courier's job
+	// (delivery.go), so nothing here waits on the network.
 }
 
 // handlePings delivers inbound commands: a "capture" takes a screenshot now; a
 // "ping" plays a sound + shows the message.
 func (a *agent) handlePings() error {
-	pings, err := ingest.FetchPings(a.client, a.cfg)
+	pings, err := ingest.FetchPings(a.pingClient, a.cfg)
 	if err != nil {
 		return err // caller checks for a revoked token; otherwise transient
 	}
@@ -249,7 +265,7 @@ func (a *agent) handlePings() error {
 			setMode(a.cfg, false)
 		case "update":
 			fmt.Println("  ⬆️  update requested")
-			selfupdate.CheckAndApply(config.Version(), config.UpdateRepo())
+			checkForUpdate()
 		default:
 			notify.Ping(p.Message)
 			fmt.Printf("  🔔 ping received: %s\n", p.Message)
@@ -260,6 +276,8 @@ func (a *agent) handlePings() error {
 
 // setMode flips personal/work capture and persists it so it survives a restart.
 func setMode(cfg *config.Config, personal bool) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	if cfg.PersonalMode == personal {
 		return
 	}
@@ -285,19 +303,11 @@ func (a *agent) tick() string {
 		fmt.Println("  warn: " + err.Error())
 		return ""
 	}
-	res := a.outbox.Submit(&queue.Entry{
+	a.submit(&queue.Entry{
 		Kind:       queue.KindActivity,
 		CapturedAt: time.Now(),
 		Sample:     &sample,
 	})
-	a.noteDelivery("activity", res)
-	if res.Delivered && !res.Queued {
-		shown := sample.ActiveWindow
-		if shown == "" {
-			shown = "(unknown)"
-		}
-		fmt.Printf("  ✓ seq %d - %s · idle %ds\n", res.Sequence, shown, sample.IdleSeconds)
-	}
 	return sample.ActiveWindow
 }
 
@@ -312,14 +322,31 @@ func (a *agent) shotTick() bool {
 		fmt.Println("  warn (screenshot): " + err.Error())
 		return false
 	}
-	res := a.outbox.Submit(&queue.Entry{
+	a.submit(&queue.Entry{
 		Kind:       queue.KindScreenshot,
 		CapturedAt: time.Now(),
 		Shot:       &shot,
 	})
-	a.noteDelivery("screenshot", res)
-	if res.Delivered && !res.Queued {
-		fmt.Printf("  ✓ screenshot %dx%d (%d KB)\n", shot.Width, shot.Height, len(shot.JPEG)/1024)
-	}
 	return true
+}
+
+// updating keeps self-update checks from piling up: a check downloads a
+// release, which can take minutes on slow wifi.
+var updating atomic.Bool
+
+// checkForUpdate looks for a newer release on its own goroutine, so a slow
+// download never holds up capture. A check already in flight wins.
+func checkForUpdate() {
+	if !updating.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer updating.Store(false)
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("  warn: self-update recovered from panic: %v\n", r)
+			}
+		}()
+		selfupdate.CheckAndApply(config.Version(), config.UpdateRepo())
+	}()
 }
